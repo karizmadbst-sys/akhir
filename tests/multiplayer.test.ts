@@ -920,7 +920,7 @@ async function runTests() {
     );
     const helperPushEv = pHelper.waitFor(
       (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'pushed',
-      'spectating friend receives pushed event'
+      'third teammate receives pushed event'
     );
     pHost.send('game:push', { yaw: Math.PI, x: -2.37, y: 1.12, z: -3.8 });
     const [evH, evF, evHl] = await Promise.all([hostPushEv, friendPushEv, helperPushEv]);
@@ -945,21 +945,15 @@ async function runTests() {
     ).length;
     assert.equal(afterSpamCount, prevFriendPushCount, 'Cooldown & recovery immunity must block rapid / chained pushes');
 
-    // Player completing Sector 3 (< 100) advances immediately to Sector 4 and cannot be pushed from Sector 3
+    // Player waiting at Sector 3 portal holds at portal for teammates, is immune to pushing, and team advances together once all reach portal
     const level3 = LEVELS.find((l) => l.id === 3)!;
     await new Promise((r) => setTimeout(r, Math.max(PUSH_COOLDOWN_MS, PUSH_RECOVERY_MS) + 60));
-    const advanceEvWait = pHost.waitFor(
+    const friendEscapedWait = pHost.waitFor(
       (p) =>
         p.event === 'game:player_event' &&
-        (p.payload as GamePlayerEvent).kind === 'level_advanced' &&
+        (p.payload as GamePlayerEvent).kind === 'escaped' &&
         (p.payload as GamePlayerEvent).userId === pFriend.user.id,
-      'friend advances from level 3 to level 4'
-    );
-    const friendLevelChangedWait = pFriend.waitFor(
-      (p) =>
-        p.event === 'game:level_changed' &&
-        (p.payload as GameLevelChangedPayload).levelId === 4,
-      'friend receives game:level_changed for level 4'
+      'friend waits at level 3 portal'
     );
     pFriend.send('game:input_state', {
       levelId: 3,
@@ -973,10 +967,14 @@ async function runTests() {
       checkpointIndex: 0,
       escaped: true,
     });
-    const [advPkt, lvlChangedPkt] = await Promise.all([advanceEvWait, friendLevelChangedWait]);
-    assert.equal((advPkt.payload as GamePlayerEvent).levelId, 4);
-    assert.equal((lvlChangedPkt.payload as GameLevelChangedPayload).prevLevelId, 3);
-    pFriend.send('game:level_ready', { levelId: 4 });
+    await friendEscapedWait;
+    assert.equal(
+      pFriend.packets.filter((p) => p.event === 'game:level_changed').length,
+      0,
+      'Solo portal arrival must NOT advance before remaining teammates arrive'
+    );
+
+    // Waiting player at portal cannot be pushed by host
     pHost.send('game:input_state', {
       levelId: 3,
       x: level3.exit.position[0],
@@ -997,11 +995,58 @@ async function runTests() {
       z: level3.exit.position[2] + 1.0,
     });
     await new Promise((r) => setTimeout(r, 80));
-    const afterAdvancePushCount = pFriend.packets.filter(
+    const afterPortalPushCount = pFriend.packets.filter(
       (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'pushed'
     ).length;
-    assert.equal(afterAdvancePushCount, prevFriendPushCount, 'Players on different levels must not be pushable');
-    console.log('   PASS: Authoritative Friends-Mode Push sync, cooldown, recovery immunity & cross-level exclusion verified.');
+    assert.equal(afterPortalPushCount, prevFriendPushCount, 'Players waiting at exit portal must not be pushable');
+
+    // Remaining two teammates reach portal -> all 3 transition to Level 4 together in the same room
+    const allLv4Waits = Promise.all([
+      pHost.waitFor(
+        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 4,
+        'host advances to level 4 with team'
+      ),
+      pFriend.waitFor(
+        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 4,
+        'friend advances to level 4 with team'
+      ),
+      pHelper.waitFor(
+        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 4,
+        'helper advances to level 4 with team'
+      ),
+    ]);
+    pHost.send('game:input_state', {
+      levelId: 3,
+      x: level3.exit.position[0],
+      y: level3.exit.position[1],
+      z: level3.exit.position[2],
+      yaw: 0,
+      animState: 'idle',
+      horizSpeed: 0,
+      inWater: false,
+      checkpointIndex: 0,
+      escaped: true,
+    });
+    pHelper.send('game:input_state', {
+      levelId: 3,
+      x: level3.exit.position[0],
+      y: level3.exit.position[1],
+      z: level3.exit.position[2],
+      yaw: 0,
+      animState: 'idle',
+      horizSpeed: 0,
+      inWater: false,
+      checkpointIndex: 0,
+      escaped: true,
+    });
+    const [hLv4, fLv4, hlLv4] = await allLv4Waits;
+    assert.equal((hLv4.payload as GameLevelChangedPayload).prevLevelId, 3);
+    assert.equal((fLv4.payload as GameLevelChangedPayload).levelId, 4);
+    assert.equal((hlLv4.payload as GameLevelChangedPayload).levelId, 4);
+    assert.equal(pHost.currentRoom?.levelId, 4);
+    assert.equal(pFriend.currentRoom?.id, pHost.currentRoom?.id);
+    assert.equal(pHelper.currentRoom?.id, pHost.currentRoom?.id);
+    console.log('   PASS: Authoritative Friends-Mode Push sync, cooldown, recovery immunity, portal immunity & team progression verified.');
 
     console.log('15. Testing Scenario 15: Spin-free sea serpent waypoint navigation (Friends Mode & Level 1 pockets)...');
     {
@@ -1333,194 +1378,105 @@ async function runTests() {
       console.log('   PASS: Exact game version compatibility enforced across WS, REST, and room invites.');
     }
 
-    console.log('18. Testing Scenario 18: Independent portal transitions & per-level progression without freezing teammates...');
+    console.log('18. Testing Scenario 18: 4-player Team-Based Portal Wait, staggered arrival, teammate death while waiting & duplicate transition guards...');
     {
-      const pA = await makeClient('ProgA');
-      const pB = await makeClient('ProgB');
-      const crWait = pA.waitFor((p) => p.event === 'room:state' && p.payload !== null, 'prog room created');
-      pA.send('room:create', { levelId: 1, gameVersion: GAME_VERSION });
+      const p1 = await makeClient('TeamP1');
+      const p2 = await makeClient('TeamP2');
+      const p3 = await makeClient('TeamP3');
+      const p4 = await makeClient('TeamP4');
+      const crWait = p1.waitFor((p) => p.event === 'room:state' && p.payload !== null, 'team room created');
+      p1.send('room:create', { levelId: 1, gameVersion: GAME_VERSION });
       await crWait;
-      await pB.http('/api/rooms/join', 'POST', { code: pA.currentRoom!.code, gameVersion: GAME_VERSION });
+      const roomCode = p1.currentRoom!.code;
+      assert.equal((await p2.http('/api/rooms/join', 'POST', { code: roomCode, gameVersion: GAME_VERSION })).status, 200);
+      assert.equal((await p3.http('/api/rooms/join', 'POST', { code: roomCode, gameVersion: GAME_VERSION })).status, 200);
+      assert.equal((await p4.http('/api/rooms/join', 'POST', { code: roomCode, gameVersion: GAME_VERSION })).status, 200);
       await new Promise((r) => setTimeout(r, 40));
 
-      const stA = pA.waitFor((p) => p.event === 'game:started', 'progA started');
-      const stB = pB.waitFor((p) => p.event === 'game:started', 'progB started');
-      pA.send('room:start');
-      await Promise.all([stA, stB]);
+      await Promise.all([
+        (async () => {
+          const waits = [p1, p2, p3, p4].map((c, idx) => c.waitFor((p) => p.event === 'game:started', `p${idx + 1} started`));
+          p1.send('room:start');
+          await Promise.all(waits);
+        })(),
+      ]);
 
-      // All players start at Level 1 in the same room
-      assert.equal(pA.currentRoom?.levelId, 1);
-
+      assert.equal(p1.currentRoom?.levelId, 1);
       const lv1Def = getLevelById(1);
       const lv2Def = getLevelById(2);
-      // Player A walks onto Level 1 exit portal -> immediately moves to Level 2 while Player B continues Level 1 uninterrupted
-      pA.send('game:input_state', {
-        levelId: 1,
-        x: lv1Def.exit.position[0],
-        y: lv1Def.exit.position[1],
-        z: lv1Def.exit.position[2],
-        yaw: 0,
-        animState: 'run',
-        horizSpeed: 6,
-        inWater: false,
-        checkpointIndex: 1,
-        escaped: false,
-      });
+      const sendAtExit = (c: TestClient, levelDef = lv1Def) => {
+        c.send('game:input_state', {
+          levelId: levelDef.id,
+          x: levelDef.exit.position[0],
+          y: levelDef.exit.position[1],
+          z: levelDef.exit.position[2],
+          yaw: 0,
+          animState: 'run',
+          horizSpeed: 6,
+          inWater: false,
+          checkpointIndex: 1,
+          escaped: false,
+        });
+      };
+
+      // Mandatory Test 1 & 2: P1 reaches portal first -> waits at portal; P2 & P3 arrive at staggered times
+      sendAtExit(p1);
       await new Promise((r) => setTimeout(r, 40));
-
-      const bChangedDuringA = pB.packets.filter((p) => p.event === 'game:level_changed').length;
-      const aLvl2Wait = pA.waitFor(
-        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 2,
-        'pA advances independently to level 2'
-      );
-      const bSawAdvWait = pB.waitFor(
-        (p) =>
-          p.event === 'game:player_event' &&
-          (p.payload as GamePlayerEvent).kind === 'level_advanced' &&
-          (p.payload as GamePlayerEvent).userId === pA.user.id &&
-          (p.payload as GamePlayerEvent).levelId === 2,
-        'pB notified that pA moved to level 2'
-      );
-      pA.send('game:portal_enter', { levelId: 1 });
-      const [aLvl2Pkt] = await Promise.all([aLvl2Wait, bSawAdvWait]);
-      const aLvl2 = aLvl2Pkt.payload as GameLevelChangedPayload;
-      assert.equal(aLvl2.prevLevelId, 1);
-      assert.equal(aLvl2.levelId, 2);
-      assert.equal(pB.packets.filter((p) => p.event === 'game:level_changed').length, bChangedDuringA, 'pB must NOT transition when pA finishes Level 1');
-
-      pA.send('game:level_ready', { levelId: 2 });
-
-      // Both players continue receiving their own independent level world updates in the same room
-      pA.send('game:input_state', {
-        levelId: 2,
-        x: lv2Def.spawn[0],
-        y: lv2Def.spawn[1],
-        z: lv2Def.spawn[2],
-        yaw: Math.PI,
-        animState: 'walk',
-        horizSpeed: 4,
-        inWater: false,
-        checkpointIndex: 0,
-        escaped: false,
-      });
-      pB.send('game:input_state', {
-        levelId: 1,
-        x: lv1Def.spawn[0],
-        y: lv1Def.spawn[1],
-        z: lv1Def.spawn[2],
-        yaw: Math.PI,
-        animState: 'walk',
-        horizSpeed: 4,
-        inWater: false,
-        checkpointIndex: 1,
-        escaped: false,
-      });
-
-      const [worldA, worldB] = await Promise.all([
-        pA.waitFor((p) => p.event === 'game:world' && (p.payload as WorldSyncPayload).levelId === 2, 'pA world level 2'),
-        pB.waitFor((p) => p.event === 'game:world' && (p.payload as WorldSyncPayload).levelId === 1, 'pB world level 1'),
-      ]);
-      const wA = worldA.payload as WorldSyncPayload;
-      const wB = worldB.payload as WorldSyncPayload;
-      assert.equal(wA.matchResult, null, 'Room must remain active');
-      assert.equal(wB.matchResult, null, 'Room must remain active');
-      assert.equal(wA.players.find((p) => p.userId === pA.user.id)?.levelId, 2);
-      assert.equal(wA.players.find((p) => p.userId === pB.user.id)?.levelId, 1);
-
-      // Player B reaches Level 1 exit portal later -> moves to Level 2 independently in same room
-      pB.send('game:input_state', {
-        levelId: 1,
-        x: lv1Def.exit.position[0],
-        y: lv1Def.exit.position[1],
-        z: lv1Def.exit.position[2],
-        yaw: 0,
-        animState: 'run',
-        horizSpeed: 6,
-        inWater: false,
-        checkpointIndex: 1,
-        escaped: false,
-      });
-      await new Promise((r) => setTimeout(r, 40));
-
-      const bLvl2Wait = pB.waitFor(
-        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 2,
-        'pB advances independently to level 2 later'
-      );
-      pB.send('game:portal_enter', { levelId: 1 });
-      await bLvl2Wait;
-      pB.send('game:level_ready', { levelId: 2 });
-      const bNowLv2 = await pB.waitFor(
+      p1.send('game:portal_enter', { levelId: 1 });
+      const world1of4 = await p1.waitFor(
         (p) =>
           p.event === 'game:world' &&
-          (p.payload as WorldSyncPayload).levelId === 2 &&
-          (p.payload as WorldSyncPayload).players.every((pl) => pl.levelId === 2),
-        'both players now active on level 2 in same room'
+          (p.payload as WorldSyncPayload).portalReadyCount === 1 &&
+          (p.payload as WorldSyncPayload).portalTotalCount === 4,
+        'world reports 1/4 ready at portal'
       );
-      assert.ok(bNowLv2);
-      console.log('   PASS: Independent portal transitions & concurrent multi-level simulation verified.');
-    }
-
-    console.log('19. Testing Scenario 19: Death auto-respawns at starting checkpoint 0 of same level while teammate transitions...');
-    {
-      const rHost = await makeClient('RespHost');
-      const rFriend = await makeClient('RespFriend');
-      const rCreated = rHost.waitFor((p) => p.event === 'room:state' && p.payload !== null, 'resp room created');
-      rHost.send('room:create', { levelId: 1, gameVersion: GAME_VERSION });
-      await rCreated;
-      await rFriend.http('/api/rooms/join', 'POST', { code: rHost.currentRoom!.code, gameVersion: GAME_VERSION });
-      await new Promise((r) => setTimeout(r, 40));
-
-      const rStarted = Promise.all([
-        rHost.waitFor((p) => p.event === 'game:started', 'rHost started'),
-        rFriend.waitFor((p) => p.event === 'game:started', 'rFriend started'),
-      ]);
-      rHost.send('room:start');
-      await rStarted;
-
-      const lv1Def = getLevelById(1);
-      // Move rFriend to Level 1 exit portal -> Level 2 independently while rHost stays on Level 1
-      rFriend.send('game:input_state', {
-        levelId: 1,
-        x: lv1Def.exit.position[0],
-        y: lv1Def.exit.position[1],
-        z: lv1Def.exit.position[2],
-        yaw: 0,
-        animState: 'run',
-        horizSpeed: 6,
-        inWater: false,
-        checkpointIndex: 1,
-        escaped: false,
-      });
-      await new Promise((r) => setTimeout(r, 40));
-
-      const fAdvWait = rFriend.waitFor(
-        (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 2,
-        'rFriend moves to level 2'
+      assert.equal((world1of4.payload as WorldSyncPayload).levelId, 1);
+      assert.equal(
+        p1.packets.filter((p) => p.event === 'game:level_changed').length,
+        0,
+        'P1 must wait at Level 1 portal while P2..P4 are still playing'
       );
-      rFriend.send('game:portal_enter', { levelId: 1 });
-      await fAdvWait;
-      rFriend.send('game:level_ready', { levelId: 2 });
 
-      // rHost enters Level 1 water at checkpointIndex=1 so serpent catches them
-      const caughtWait = rHost.waitFor(
+      // Duplicate portal_enter spam from P1 must not increment count or cause duplicate transitions later
+      p1.send('game:portal_enter', { levelId: 1 });
+      sendAtExit(p2);
+      await new Promise((r) => setTimeout(r, 40));
+      p2.send('game:portal_enter', { levelId: 1 });
+      sendAtExit(p3);
+      await new Promise((r) => setTimeout(r, 40));
+      p3.send('game:portal_enter', { levelId: 1 });
+
+      const world3of4 = await p2.waitFor(
+        (p) =>
+          p.event === 'game:world' &&
+          (p.payload as WorldSyncPayload).portalReadyCount === 3 &&
+          (p.payload as WorldSyncPayload).portalTotalCount === 4,
+        'world reports 3/4 ready at portal'
+      );
+      assert.equal((world3of4.payload as WorldSyncPayload).levelId, 1);
+      for (const c of [p1, p2, p3, p4]) {
+        assert.equal(c.packets.filter((p) => p.event === 'game:level_changed').length, 0, 'No player advances before all 4 reach portal');
+      }
+
+      // Mandatory Test 3: P4 dies while P1, P2, P3 wait at Level 1 portal -> P1..P3 remain waiting & P4 respawns on Level 1 (no Spectator Mode)
+      const p4CaughtWait = p4.waitFor(
         (p) =>
           p.event === 'game:player_event' &&
           (p.payload as GamePlayerEvent).kind === 'caught' &&
-          (p.payload as GamePlayerEvent).userId === rHost.user.id,
-        'rHost caught on level 1',
-        EAT_DURATION_MS + 4000
+          (p.payload as GamePlayerEvent).userId === p4.user.id,
+        'p4 caught while teammates wait at portal',
+        EAT_DURATION_MS + 4500
       );
-      const respawnWait = rHost.waitFor(
+      const p4RespawnWait = p4.waitFor(
         (p) =>
           p.event === 'game:player_event' &&
           (p.payload as GamePlayerEvent).kind === 'respawned' &&
-          (p.payload as GamePlayerEvent).userId === rHost.user.id,
-        'rHost automatically respawned at level 1 start',
+          (p.payload as GamePlayerEvent).userId === p4.user.id,
+        'p4 respawns automatically on Level 1',
         EAT_DURATION_MS + RESPAWN_DELAY_MS + 4500
       );
-
-      const swimLoop = setInterval(() => {
-        rHost.send('game:input_state', {
+      const p4SwimLoop = setInterval(() => {
+        p4.send('game:input_state', {
           levelId: 1,
           x: 0,
           y: lv1Def.bounds.waterY - 0.8,
@@ -1533,40 +1489,360 @@ async function runTests() {
           escaped: false,
         });
       }, 45);
+      await p4CaughtWait;
+      clearInterval(p4SwimLoop);
+      const p4RespEv = (await p4RespawnWait).payload as GamePlayerEvent;
+      assert.equal(p4RespEv.levelId, 1, 'Dead player respawns at Level 1 start while teammates wait');
 
-      await caughtWait;
-      clearInterval(swimLoop);
-      const respPkt = await respawnWait;
-      const respEv = respPkt.payload as GamePlayerEvent;
-      assert.equal(respEv.levelId, 1, 'Respawn must occur on the same level (Level 1)');
-      assert.ok(Math.abs((respEv.x ?? 999) - lv1Def.spawn[0]) < 1.5, 'Respawn X must be at Level 1 starting checkpoint');
-      assert.ok(Math.abs((respEv.z ?? 999) - lv1Def.spawn[2]) < 1.5, 'Respawn Z must be at Level 1 starting checkpoint');
-
-      const postRespWorld = await rHost.waitFor(
+      // Verify waiting players are still at Level 1 portal and room is unbroken
+      const waitCheckWorld = await p1.waitFor(
         (p) => {
           if (p.event !== 'game:world') return false;
           const w = p.payload as WorldSyncPayload;
-          if (w.levelId !== 1) return false;
-          const hs = w.players.find((pl) => pl.userId === rHost.user.id);
-          const fs = w.players.find((pl) => pl.userId === rFriend.user.id);
+          const s1 = w.players.find((pl) => pl.userId === p1.user.id);
+          const s4 = w.players.find((pl) => pl.userId === p4.user.id);
           return Boolean(
-            hs &&
-              hs.alive &&
-              hs.checkpointIndex === 0 &&
-              hs.levelId === 1 &&
-              fs &&
-              fs.levelId === 2 &&
-              w.matchResult === null
+            w.levelId === 1 &&
+              w.portalReadyCount === 3 &&
+              s1?.escaped &&
+              s4?.alive &&
+              !s4?.escaped &&
+              s4?.checkpointIndex === 0
           );
         },
-        'world confirms checkpoint 0 reset for dead player only while teammate stays on level 2'
+        'p1..p3 stay waiting at portal while p4 auto-respawns at CP 0'
       );
-      assert.ok(postRespWorld);
-      console.log('   PASS: Same-level auto-respawn at checkpoint 0 verified without closing room or resetting teammate.');
+      assert.ok(waitCheckWorld);
+
+      // Mandatory Test 6: P4 reaches portal -> ALL 4 players transition together to Level 2
+      const teamLv2Waits = Promise.all(
+        [p1, p2, p3, p4].map((c, idx) =>
+          c.waitFor(
+            (p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 2,
+            `p${idx + 1} receives synchronized transition to level 2`
+          )
+        )
+      );
+      sendAtExit(p4);
+      await new Promise((r) => setTimeout(r, 40));
+      p4.send('game:portal_enter', { levelId: 1 });
+      // Also spam portal_enter from P1 to ensure no double transition to Level 3
+      p1.send('game:portal_enter', { levelId: 1 });
+      const lv2Pkts = await teamLv2Waits;
+      for (const pkt of lv2Pkts) {
+        const pay = pkt.payload as GameLevelChangedPayload;
+        assert.equal(pay.prevLevelId, 1);
+        assert.equal(pay.levelId, 2);
+        assert.ok(pay.players.every((pl) => pl.levelId === 2 && !pl.escaped && pl.alive && pl.checkpointIndex === 0));
+      }
+      await new Promise((r) => setTimeout(r, 100));
+      for (const c of [p1, p2, p3, p4]) {
+        assert.equal(
+          c.packets.filter((p) => p.event === 'game:level_changed').length,
+          1,
+          'Exactly one level transition event per level completion (no duplicate transitions)'
+        );
+        c.send('game:level_ready', { levelId: 2 });
+        assert.equal(c.currentRoom?.id, p1.currentRoom?.id);
+        assert.equal(c.currentRoom?.levelId, 2);
+      }
+
+      // Verify everyone is active on Level 2 spawn deck
+      const lv2WorldPkt = await p1.waitFor(
+        (p) =>
+          p.event === 'game:world' &&
+          (p.payload as WorldSyncPayload).levelId === 2 &&
+          (p.payload as WorldSyncPayload).players.every((pl) => pl.levelId === 2 && pl.alive && !pl.escaped),
+        'all 4 players synced onto Level 2 together'
+      );
+      assert.equal((lv2WorldPkt.payload as WorldSyncPayload).portalReadyCount, 0);
+      assert.ok(lv2Def.id === 2);
+      console.log('   PASS: 4-player Team Portal Wait, staggered arrival, teammate death during wait, duplicate guard & synchronized Level 2 transition verified.');
     }
 
-    console.log('20. Testing Scenario 20: Cloudflare GameRoomDO version checks, independent progression & auto-respawn parity...');
+    console.log('19. Testing Scenario 19: Level 2+ checkpoint-0 respawn (NOT Level 1), simultaneous deaths & no Spectator Mode...');
     {
+      const d1 = await makeClient('DeathLv2_1');
+      const d2 = await makeClient('DeathLv2_2');
+      const d3 = await makeClient('DeathLv2_3');
+      const crWait = d1.waitFor((p) => p.event === 'room:state' && p.payload !== null, 'death-lv2 room created');
+      d1.send('room:create', { levelId: 1, gameVersion: GAME_VERSION });
+      await crWait;
+      const code = d1.currentRoom!.code;
+      await d2.http('/api/rooms/join', 'POST', { code, gameVersion: GAME_VERSION });
+      await d3.http('/api/rooms/join', 'POST', { code, gameVersion: GAME_VERSION });
+      await new Promise((r) => setTimeout(r, 40));
+
+      await Promise.all([
+        (async () => {
+          const st = [d1, d2, d3].map((c, i) => c.waitFor((p) => p.event === 'game:started', `d${i + 1} started`));
+          d1.send('room:start');
+          await Promise.all(st);
+        })(),
+      ]);
+
+      // Advance team cleanly from Level 1 -> Level 2 together
+      const lv1Def = getLevelById(1);
+      const lv2Def = getLevelById(2);
+      const lv2TransWaits = Promise.all(
+        [d1, d2, d3].map((c, i) =>
+          c.waitFor((p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 2, `d${i + 1} -> lv2`)
+        )
+      );
+      for (const c of [d1, d2, d3]) {
+        c.send('game:input_state', {
+          levelId: 1,
+          x: lv1Def.exit.position[0],
+          y: lv1Def.exit.position[1],
+          z: lv1Def.exit.position[2],
+          yaw: 0,
+          animState: 'run',
+          horizSpeed: 6,
+          inWater: false,
+          checkpointIndex: 1,
+          escaped: true,
+        });
+      }
+      await lv2TransWaits;
+      for (const c of [d1, d2, d3]) c.send('game:level_ready', { levelId: 2 });
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Place d3 safely waiting at Level 2 exit portal; send d1 and d2 into Level 2 water simultaneously with checkpointIndex=1
+      d3.send('game:input_state', {
+        levelId: 2,
+        x: lv2Def.exit.position[0],
+        y: lv2Def.exit.position[1],
+        z: lv2Def.exit.position[2],
+        yaw: 0,
+        animState: 'idle',
+        horizSpeed: 0,
+        inWater: false,
+        checkpointIndex: 1,
+        escaped: true,
+      });
+
+      const d1CaughtWait = d1.waitFor(
+        (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'caught' && (p.payload as GamePlayerEvent).userId === d1.user.id,
+        'd1 caught on Level 2',
+        EAT_DURATION_MS + 6000
+      );
+      const d2CaughtWait = d2.waitFor(
+        (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'caught' && (p.payload as GamePlayerEvent).userId === d2.user.id,
+        'd2 caught simultaneously on Level 2',
+        EAT_DURATION_MS + 6000
+      );
+      const d1RespWait = d1.waitFor(
+        (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'respawned' && (p.payload as GamePlayerEvent).userId === d1.user.id,
+        'd1 respawned on Level 2',
+        EAT_DURATION_MS + RESPAWN_DELAY_MS + 6500
+      );
+      const d2RespWait = d2.waitFor(
+        (p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'respawned' && (p.payload as GamePlayerEvent).userId === d2.user.id,
+        'd2 respawned on Level 2',
+        EAT_DURATION_MS + RESPAWN_DELAY_MS + 6500
+      );
+
+      // Position d1 and d2 near Level 2's serpents in water so both are caught concurrently
+      const lv2M0 = lv2Def.monsters[0];
+      const lv2M1 = lv2Def.monsters[1] || lv2Def.monsters[0];
+      const simSwimTimer = setInterval(() => {
+        d1.send('game:input_state', {
+          levelId: 2,
+          x: lv2M0.waypoints[0][0],
+          y: lv2Def.bounds.waterY - 0.8,
+          z: lv2M0.waypoints[0][1],
+          yaw: 0,
+          animState: 'swim',
+          horizSpeed: 2,
+          inWater: true,
+          checkpointIndex: 1,
+          escaped: false,
+        });
+        d2.send('game:input_state', {
+          levelId: 2,
+          x: lv2M1.waypoints[0][0] + 0.5,
+          y: lv2Def.bounds.waterY - 0.8,
+          z: lv2M1.waypoints[0][1] + 0.5,
+          yaw: 0,
+          animState: 'swim',
+          horizSpeed: 2,
+          inWater: true,
+          checkpointIndex: 1,
+          escaped: false,
+        });
+      }, 45);
+
+      await Promise.all([d1CaughtWait, d2CaughtWait]);
+      clearInterval(simSwimTimer);
+      const [r1Pkt, r2Pkt] = await Promise.all([d1RespWait, d2RespWait]);
+      const r1Ev = r1Pkt.payload as GamePlayerEvent;
+      const r2Ev = r2Pkt.payload as GamePlayerEvent;
+
+      // Mandatory Tests 4 & 5: Respawn at Level 2 checkpoint 0 (NOT Level 1!), simultaneous deaths cleanly handled, no Spectator Mode
+      const lv2StartPlat = lv2Def.platforms[0];
+      const maxDx = Math.max(2.5, (lv2StartPlat?.size[0] ?? 6.4) * 0.5);
+      const maxDz = Math.max(2.5, (lv2StartPlat?.size[2] ?? 5.4) * 0.5);
+      const cx2 = lv2StartPlat ? lv2StartPlat.position[0] : lv2Def.spawn[0];
+      const cz2 = lv2StartPlat ? lv2StartPlat.position[2] : lv2Def.spawn[2];
+      assert.equal(r1Ev.levelId, 2, 'd1 must respawn on current Level 2, NOT Level 1');
+      assert.equal(r2Ev.levelId, 2, 'd2 must respawn on current Level 2, NOT Level 1');
+      assert.ok(Math.abs((r1Ev.x ?? 999) - cx2) <= maxDx, 'd1 respawn X on Level 2 starting deck');
+      assert.ok(Math.abs((r1Ev.z ?? 999) - cz2) <= maxDz, 'd1 respawn Z on Level 2 starting deck');
+      assert.ok(Math.abs((r2Ev.x ?? 999) - cx2) <= maxDx, 'd2 respawn X on Level 2 starting deck');
+      assert.ok(Math.abs((r2Ev.z ?? 999) - cz2) <= maxDz, 'd2 respawn Z on Level 2 starting deck');
+
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(
+        d1.packets.filter((p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'respawned' && (p.payload as GamePlayerEvent).userId === d1.user.id).length,
+        1,
+        'No duplicate respawn for d1'
+      );
+      assert.equal(
+        d2.packets.filter((p) => p.event === 'game:player_event' && (p.payload as GamePlayerEvent).kind === 'respawned' && (p.payload as GamePlayerEvent).userId === d2.user.id).length,
+        1,
+        'No duplicate respawn for d2'
+      );
+
+      // Confirm world stays on Level 2, d1/d2 alive at CP 0, d3 still waiting at portal (`escaped: true`)
+      const lv2PostRespWorld = await d1.waitFor((p) => {
+        if (p.event !== 'game:world') return false;
+        const w = p.payload as WorldSyncPayload;
+        const p1s = w.players.find((pl) => pl.userId === d1.user.id);
+        const p2s = w.players.find((pl) => pl.userId === d2.user.id);
+        const p3s = w.players.find((pl) => pl.userId === d3.user.id);
+        return Boolean(
+          w.levelId === 2 &&
+            w.matchResult === null &&
+            p1s?.alive &&
+            p1s.checkpointIndex === 0 &&
+            p1s.levelId === 2 &&
+            p2s?.alive &&
+            p2s.checkpointIndex === 0 &&
+            p2s.levelId === 2 &&
+            p3s?.alive &&
+            p3s.escaped &&
+            p3s.levelId === 2
+        );
+      }, 'post-simultaneous-respawn world check on Level 2');
+      assert.ok(lv2PostRespWorld);
+
+      // Now respawned d1 & d2 recover controls, reach Level 2 exit portal -> all 3 transition to Level 3 together!
+      const lv3TransWaits = Promise.all(
+        [d1, d2, d3].map((c, i) =>
+          c.waitFor((p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 3, `d${i + 1} -> lv3 together`)
+        )
+      );
+      for (const c of [d1, d2]) {
+        c.send('game:input_state', {
+          levelId: 2,
+          x: lv2Def.exit.position[0],
+          y: lv2Def.exit.position[1],
+          z: lv2Def.exit.position[2],
+          yaw: 0,
+          animState: 'run',
+          horizSpeed: 6,
+          inWater: false,
+          checkpointIndex: 1,
+          escaped: true,
+        });
+      }
+      await lv3TransWaits;
+      assert.equal(d1.currentRoom?.levelId, 3);
+      assert.equal(d2.currentRoom?.id, d1.currentRoom?.id);
+      assert.equal(d3.currentRoom?.id, d1.currentRoom?.id);
+      console.log('   PASS: Level 2+ checkpoint-0 respawn, simultaneous deaths, preserved portal wait & Level 3 team transition verified.');
+    }
+
+    console.log('20. Testing Scenario 20: Disconnect/leave edge cases, Level 100 completion & Cloudflare GameRoomDO Team Portal/Respawn parity...');
+    {
+      // Part A: Permanent leave unblocks teammates waiting at portal; Final Level 100 requires all active teammates before match completion
+      const e1 = await makeClient('Edge1');
+      const e2 = await makeClient('Edge2');
+      const e3 = await makeClient('Edge3');
+      const crWait = e1.waitFor((p) => p.event === 'room:state' && p.payload !== null, 'edge room created');
+      e1.send('room:create', { levelId: 99, gameVersion: GAME_VERSION });
+      await crWait;
+      await e2.http('/api/rooms/join', 'POST', { code: e1.currentRoom!.code, gameVersion: GAME_VERSION });
+      await e3.http('/api/rooms/join', 'POST', { code: e1.currentRoom!.code, gameVersion: GAME_VERSION });
+      await new Promise((r) => setTimeout(r, 40));
+      const startWaits = Promise.all([
+        e1.waitFor((p) => p.event === 'game:started', 'e1 started lv99'),
+        e2.waitFor((p) => p.event === 'game:started', 'e2 started lv99'),
+        e3.waitFor((p) => p.event === 'game:started', 'e3 started lv99'),
+      ]);
+      e1.send('room:start');
+      await startWaits;
+
+      const lv99Def = getLevelById(99);
+      const lv100Def = getLevelById(100);
+      // e1 & e2 wait at Level 99 portal while e3 leaves permanently -> e1 & e2 must immediately advance to Level 100 without getting stuck
+      for (const c of [e1, e2]) {
+        c.send('game:input_state', {
+          levelId: 99,
+          x: lv99Def.exit.position[0],
+          y: lv99Def.exit.position[1],
+          z: lv99Def.exit.position[2],
+          yaw: 0,
+          animState: 'idle',
+          horizSpeed: 0,
+          inWater: false,
+          checkpointIndex: 0,
+          escaped: true,
+        });
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(e1.packets.filter((p) => p.event === 'game:level_changed').length, 0, 'Wait while e3 still in room');
+
+      const lv100AdvanceWaits = Promise.all([
+        e1.waitFor((p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 100, 'e1 -> lv100 when e3 leaves'),
+        e2.waitFor((p) => p.event === 'game:level_changed' && (p.payload as GameLevelChangedPayload).levelId === 100, 'e2 -> lv100 when e3 leaves'),
+      ]);
+      e3.send('room:leave');
+      await lv100AdvanceWaits;
+      e1.send('game:level_ready', { levelId: 100 });
+      e2.send('game:level_ready', { levelId: 100 });
+
+      // On final Level 100, e1 reaching portal must wait for e2; only when e2 also reaches Level 100 portal does match finish cleanly
+      e1.send('game:input_state', {
+        levelId: 100,
+        x: lv100Def.exit.position[0],
+        y: lv100Def.exit.position[1],
+        z: lv100Def.exit.position[2],
+        yaw: 0,
+        animState: 'idle',
+        horizSpeed: 0,
+        inWater: false,
+        checkpointIndex: 0,
+        escaped: true,
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(e1.currentRoom?.status, 'playing', 'Level 100 must wait for last teammate before ending match');
+
+      const finalEndWaits = Promise.all([
+        e1.waitFor((p) => p.event === 'game:world' && Boolean((p.payload as WorldSyncPayload).matchResult), 'e1 match finalized'),
+        e2.waitFor((p) => p.event === 'game:world' && Boolean((p.payload as WorldSyncPayload).matchResult), 'e2 match finalized'),
+        e1.waitFor((p) => p.event === 'room:state' && (p.payload as RoomState | null)?.status === 'ended', 'e1 room status ended'),
+      ]);
+      e2.send('game:input_state', {
+        levelId: 100,
+        x: lv100Def.exit.position[0],
+        y: lv100Def.exit.position[1],
+        z: lv100Def.exit.position[2],
+        yaw: 0,
+        animState: 'idle',
+        horizSpeed: 0,
+        inWater: false,
+        checkpointIndex: 0,
+        escaped: true,
+      });
+      const [fin1, fin2] = await finalEndWaits;
+      const r1 = (fin1.payload as WorldSyncPayload).matchResult!;
+      assert.equal(r1.reason, 'all_resolved');
+      assert.equal(r1.outcome, 'escaped');
+      assert.equal(r1.survivors.length, 2);
+      assert.equal((fin2.payload as WorldSyncPayload).matchResult?.survivors.length, 2);
+
+      // Part B: Cloudflare GameRoomDO Team-Based Portal Wait, Simultaneous Arrival, and No Spectator Mode parity
       const roomModPath = '../cloudflare/src/' + 'roomDO.ts';
       const { GameRoomDO } = await import(/* @vite-ignore */ roomModPath);
       const deliveredBatches: any[] = [];
@@ -1626,13 +1902,43 @@ async function runTests() {
         },
       });
 
-      const portalRes = await callRoom({ action: 'portal_enter', userId: u1.id, levelId: 1 });
-      const lvlChangedDeliv = portalRes.batch?.deliveries?.find((d: any) => d.event === 'game:level_changed');
-      assert.ok(lvlChangedDeliv, 'Cloudflare DO must emit game:level_changed to portal entrant');
-      assert.equal(lvlChangedDeliv.targetUserId, u1.id);
-      assert.equal(lvlChangedDeliv.payload.levelId, 2);
+      // u1 enters portal alone -> waits at Level 1 portal (`portalReadyCount=1, portalTotalCount=2`), NO `game:level_changed` yet
+      const p1PortalRes = await callRoom({ action: 'portal_enter', userId: u1.id, levelId: 1 });
+      assert.equal(
+        p1PortalRes.batch?.deliveries?.some((d: any) => d.event === 'game:level_changed'),
+        false,
+        'Cloudflare DO must NOT advance u1 alone before u2 reaches portal'
+      );
+      const p1WaitingWorld = p1PortalRes.batch?.deliveries?.find(
+        (d: any) => d.event === 'game:world' && d.targetUserId === u1.id
+      )?.payload as WorldSyncPayload | undefined;
+      assert.equal(p1WaitingWorld?.portalReadyCount, 1);
+      assert.equal(p1WaitingWorld?.portalTotalCount, 2);
+
+      // u2 enters Level 1 portal -> Cloudflare DO emits game:level_changed (Level 2) for BOTH u1 and u2 simultaneously
+      await callRoom({
+        action: 'input_state',
+        userId: u2.id,
+        packet: {
+          levelId: 1,
+          x: lv1Def.exit.position[0],
+          y: lv1Def.exit.position[1],
+          z: lv1Def.exit.position[2],
+          yaw: 0,
+          animState: 'run',
+          horizSpeed: 6,
+          inWater: false,
+          checkpointIndex: 1,
+          escaped: false,
+        },
+      });
+      const p2PortalRes = await callRoom({ action: 'portal_enter', userId: u2.id, levelId: 1 });
+      const lvlChangedDelivs = (p2PortalRes.batch?.deliveries || []).filter((d: any) => d.event === 'game:level_changed');
+      assert.equal(lvlChangedDelivs.length, 2, 'Cloudflare DO must transition both teammates together');
+      assert.ok(lvlChangedDelivs.every((d: any) => d.payload.levelId === 2 && d.payload.prevLevelId === 1));
 
       await callRoom({ action: 'level_ready', userId: u1.id, levelId: 2 });
+      await callRoom({ action: 'level_ready', userId: u2.id, levelId: 2 });
       const lv2InputRes = await callRoom({
         action: 'input_state',
         userId: u1.id,
@@ -1655,17 +1961,44 @@ async function runTests() {
       const u1StateAfterPortal = (u1WorldDeliv?.payload as WorldSyncPayload)?.players?.find(
         (pl: any) => pl.userId === u1.id
       );
-      assert.equal(u1StateAfterPortal?.levelId, 2);
-      const u2StillLv1 = (u1WorldDeliv?.payload as WorldSyncPayload)?.players?.find(
+      const u2StateAfterPortal = (u1WorldDeliv?.payload as WorldSyncPayload)?.players?.find(
         (pl: any) => pl.userId === u2.id
       );
-      assert.equal(u2StillLv1?.levelId, 1, 'Cloudflare DO must keep u2 on Level 1');
+      assert.equal(u1StateAfterPortal?.levelId, 2);
+      assert.equal(u2StateAfterPortal?.levelId, 2);
+
+      // Verify temporary disconnect keeps waiting teammate paused cleanly until reconnect
+      await callRoom({ action: 'disconnect', userId: u2.id });
+      await callRoom({
+        action: 'input_state',
+        userId: u1.id,
+        packet: {
+          levelId: 2,
+          x: lv2Def.exit.position[0],
+          y: lv2Def.exit.position[1],
+          z: lv2Def.exit.position[2],
+          yaw: 0,
+          animState: 'idle',
+          horizSpeed: 0,
+          inWater: false,
+          checkpointIndex: 1,
+          escaped: true,
+        },
+      });
+      const waitDuringDisc = await callRoom({ action: 'portal_enter', userId: u1.id, levelId: 2 });
+      assert.equal(
+        waitDuringDisc.batch?.deliveries?.some((d: any) => d.event === 'game:level_changed'),
+        false,
+        'Cloudflare DO must tolerate temporary disconnect grace window without abandoning u2'
+      );
+      const reconRes = await callRoom({ action: 'reconnect', userId: u2.id });
+      assert.equal(reconRes.room?.levelId, 2, 'Reconnecting player must rejoin current team level 2');
 
       await callRoom({ action: 'close', userId: u1.id });
-      console.log('   PASS: Cloudflare GameRoomDO version mismatch rejection & independent progression verified.');
+      console.log('   PASS: Disconnect/leave edge cases, Level 100 completion & Cloudflare GameRoomDO Team Portal parity verified.');
     }
 
-    console.log('\nALL 20 MULTIPLAYER, VERSION, PROGRESSION, RESPAWN, SPECTATOR & CLOUDFLARE PARITY SCENARIOS PASSED!');
+    console.log('\nALL 20 MULTIPLAYER, VERSION, TEAM PORTAL PROGRESSION, RESPAWN, NO-SPECTATOR & CLOUDFLARE PARITY SCENARIOS PASSED!');
   } finally {
     for (const c of clients) {
       c.close();

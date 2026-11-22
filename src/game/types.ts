@@ -204,6 +204,9 @@ export interface HudSnapshot {
   isPointerLocked: boolean;
   deathReason: 'caught' | 'timeout' | null;
   isMultiplayer: boolean;
+  mpPortalWaiting: boolean;
+  mpPortalReadyCount: number;
+  mpPortalTotalCount: number;
   pushCooldown: number;
   pushMaxCooldown: number;
   canPushTarget: boolean;

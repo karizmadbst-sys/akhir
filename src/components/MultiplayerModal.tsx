@@ -574,7 +574,7 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
                             Create Private Room
                           </h3>
                           <p className="text-[11px] text-[#8ea8ae]">
-                            All players start at Sector 01 and advance independently.
+                            All players start at Sector 01 and advance through portals together.
                           </p>
                         </div>
                         <span className="px-2 py-0.5 rounded bg-[#18292e] border border-[#324d54] text-[9px] font-mono text-[#7ce6c4] uppercase">
@@ -1150,36 +1150,25 @@ export const MultiplayerResultModal: React.FC<{
 };
 
 /* ============================================================================
- * IN-GAME MULTIPLAYER STATUS BAR (RESPAWN / SPECTATING / ESCAPED)
+ * IN-GAME MULTIPLAYER STATUS BAR (RESPAWN / WAITING AT PORTAL)
  * ==========================================================================*/
 export const MultiplayerStatusPill: React.FC<{
   status: 'caught' | 'escaped';
-  aliveCount: number;
-  totalCount: number;
-  spectateName?: string | null;
-  spectateLevelId?: number | null;
-  canCycleSpectator?: boolean;
-  onCycleSpectator?: () => void;
+  portalReadyCount: number;
+  portalTotalCount: number;
   onLeave: () => void;
 }> = ({
   status,
-  aliveCount,
-  totalCount,
-  spectateName,
-  spectateLevelId,
-  canCycleSpectator = false,
-  onCycleSpectator,
+  portalReadyCount,
+  portalTotalCount,
   onLeave,
 }) => {
-  const sectorTag = spectateLevelId ? ` S${String(spectateLevelId).padStart(2, '0')}` : '';
+  const safeTotal = Math.max(1, portalTotalCount);
+  const safeReady = Math.min(safeTotal, Math.max(status === 'escaped' ? 1 : 0, portalReadyCount));
   const text =
     status === 'caught'
-      ? spectateName
-        ? `RESPAWNING AT START · WATCHING ${spectateName}`
-        : 'RESPAWNING AT SECTOR START...'
-      : spectateName
-        ? `ESCAPED · WATCHING ${spectateName}${sectorTag} (${aliveCount}/${totalCount})`
-        : `ESCAPED · WATCHING (${aliveCount}/${totalCount})`;
+      ? 'RESPAWNING AT SECTOR START...'
+      : `WAITING AT PORTAL FOR TEAMMATES (${safeReady}/${safeTotal} READY)`;
 
   return (
     <div className="fixed top-12 sm:top-14 left-1/2 -translate-x-1/2 z-25 pointer-events-auto flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#0b1316]/90 border border-[#3e595e] shadow-xl">
@@ -1187,16 +1176,6 @@ export const MultiplayerStatusPill: React.FC<{
         className={`w-3.5 h-3.5 shrink-0 ${status === 'caught' ? 'text-[#f06868]' : 'text-[#52e0b6]'}`}
       />
       <span className="text-[11px] font-mono text-[#e4f2f4] whitespace-nowrap">{text}</span>
-      {canCycleSpectator && onCycleSpectator && (
-        <button
-          type="button"
-          onClick={onCycleSpectator}
-          className="px-2 py-0.5 rounded bg-[#142529] hover:bg-[#1d343a] border border-[#3d646b] text-[10px] font-mono uppercase text-[#9beee0] cursor-pointer"
-          title="Switch Teammate (Q / Tab)"
-        >
-          Switch [Q]
-        </button>
-      )}
       <button
         type="button"
         onClick={onLeave}

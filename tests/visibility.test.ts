@@ -124,10 +124,9 @@ function createMinimalEngineHarness(levelId: number, textures: TextureBundle) {
   eng.mpLocalBeingEaten = false;
   eng.mpLocalEscaped = false;
   eng.mpLocalTransitioning = false;
-  eng.mpSpectateUserId = null;
-  eng.mpSpectatedPos = new THREE.Vector3();
-  eng.mpSpectatedInWater = false;
-  eng.mpLastServerSpectateLevel = null;
+  eng.mpPortalReadyCount = 0;
+  eng.mpPortalTotalCount = 0;
+  eng.mpLastSentEscaped = false;
   eng.mpTriggeredDeathIds = new Set();
   eng.remotePlayers = new Map();
   eng.monsters = [];
@@ -155,6 +154,30 @@ function createMinimalEngineHarness(levelId: number, textures: TextureBundle) {
   eng.virtualRun = false;
   eng.virtualAutoRun = false;
   eng.ensureLocalPlayerVisible = () => {};
+  eng.lastHudSnap = {
+    levelId: -1,
+    timeRemaining: -1,
+    timeElapsed: -1,
+    stamina: -1,
+    inWater: false,
+    underwater: false,
+    waterJumpCooldown: -1,
+    monsterDist: -1,
+    monsterAlert: '',
+    checkpointIndex: -1,
+    totalCheckpoints: -1,
+    checkpointNotice: null,
+    activeQuality: '',
+    fps: -1,
+    isPointerLocked: false,
+    deathReason: null,
+    isMultiplayer: false,
+    mpPortalWaiting: false,
+    mpPortalReadyCount: -1,
+    mpPortalTotalCount: -1,
+    pushCooldown: -1,
+    canPushTarget: false,
+  };
 
   eng.walls = def.walls.map((w) => ({
     centerX: w.position[0],
@@ -857,6 +880,12 @@ function testCameraOcclusionRespawnAndMultiplayerVisibility(textures: TextureBun
   assert.equal(rp.rig.root.scale.x, 1, 'Cleared eating state must restore scale=1 on alive remote player');
   assert.equal(rp.rig.root.visible, true, 'Cleared eating state must restore visible=true on alive remote player');
 
+  // Portal-waiting remote player stays visible at the exit portal instead of vanishing
+  world.players[1].escaped = true;
+  eng.applyMultiplayerWorld(world);
+  eng.updateRemotePlayers(0.016);
+  assert.equal(rp.rig.root.visible, true, 'Teammate waiting at portal must stay visible');
+
   eng.clearRemotePlayers();
   monsterRig.dispose();
   eng.playerRig.dispose();
@@ -1389,6 +1418,7 @@ function testSpawnVisibilityAndRigReset(textures: TextureBundle): void {
   const buildWallsIdx = loadLevelBody.indexOf('this.buildInnerWalls(def)');
   const snapCamIdx = loadLevelBody.lastIndexOf('this.snapPlayCameraImmediate()');
   assert.ok(buildWallsIdx > 0 && snapCamIdx > buildWallsIdx, 'loadLevel must snap camera after platforms and walls are built');
+  assert.equal(/spectat/i.test(engineSrc), false, 'engine.ts must not contain any Spectator Mode logic');
 }
 
 async function run(): Promise<void> {

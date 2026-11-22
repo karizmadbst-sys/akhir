@@ -126,6 +126,9 @@ const INITIAL_HUD: HudSnapshot = {
   isPointerLocked: false,
   deathReason: null,
   isMultiplayer: false,
+  mpPortalWaiting: false,
+  mpPortalReadyCount: 0,
+  mpPortalTotalCount: 0,
   pushCooldown: 0,
   pushMaxCooldown: 2.5,
   canPushTarget: false,
@@ -170,20 +173,9 @@ export default function App() {
   const [voiceSnap, setVoiceSnap] = useState<VoiceChatSnapshot>(() => voiceMgr.getSnapshot());
   const [isMultiplayerMatch, setIsMultiplayerMatch] = useState(false);
   const [mpLocalStatus, setMpLocalStatus] = useState<'playing' | 'caught' | 'escaped'>('playing');
-  const [mpAliveCount, setMpAliveCount] = useState(0);
-  const [mpTotalCount, setMpTotalCount] = useState(0);
+  const [mpPortalReadyCount, setMpPortalReadyCount] = useState(0);
+  const [mpPortalTotalCount, setMpPortalTotalCount] = useState(0);
   const [mpMatchResult, setMpMatchResult] = useState<MatchResultSummary | null>(null);
-  const [mpSpectateInfo, setMpSpectateInfo] = useState<{
-    spectating: boolean;
-    targetName: string | null;
-    targetLevelId: number | null;
-    canCycle: boolean;
-  }>({
-    spectating: false,
-    targetName: null,
-    targetLevelId: null,
-    canCycle: false,
-  });
 
   // Loading & seamless scene transition overlay state
   const [loadingOverlay, setLoadingOverlay] = useState<{
@@ -205,8 +197,6 @@ export default function App() {
   const latestElapsedRef = useRef<number>(0);
   const isMpMatchRef = useRef<boolean>(false);
   isMpMatchRef.current = isMultiplayerMatch;
-  const mpLocalStatusRef = useRef<'playing' | 'caught' | 'escaped'>('playing');
-  mpLocalStatusRef.current = mpLocalStatus;
   const transitionTokenRef = useRef<number>(0);
   const fadeTimerRef = useRef<number | null>(null);
   const isPreparingMpRef = useRef<boolean>(false);
@@ -366,23 +356,10 @@ export default function App() {
         setMpLocalStatus('playing');
       },
       onMultiplayerPortalEnter: (levelId) => {
-        recordCompletedLevel(levelId, latestElapsedRef.current);
         mpClient.sendPortalEnter(levelId);
-      },
-      onMultiplayerSpectateLevel: (levelId) => {
-        mpClient.sendSpectateLevel(levelId);
-      },
-      onMultiplayerSpectatorChange: (info) => {
-        setMpSpectateInfo({
-          spectating: info.spectating,
-          targetName: info.targetName,
-          targetLevelId: info.targetLevelId,
-          canCycle: info.canCycle,
-        });
       },
       onMultiplayerEscaped: () => {
         setMpLocalStatus('escaped');
-        recordCompletedLevel(activeLevelIdRef.current, latestElapsedRef.current);
       },
     }, characterId);
 
@@ -476,9 +453,20 @@ export default function App() {
         setShowLevels(false);
         setShowSettings(false);
         setMpMatchResult(null);
-        setMpLocalStatus('playing');
-        setMpAliveCount(payload.players.filter((p) => p.alive && !p.escaped).length);
-        setMpTotalCount(payload.players.length);
+        const localInit = payload.players.find((p) => p.userId === uid);
+        setMpLocalStatus(
+          localInit?.escaped ? 'escaped' : localInit?.alive === false ? 'caught' : 'playing'
+        );
+        setMpPortalReadyCount(
+          payload.players.filter(
+            (p) =>
+              p.alive &&
+              p.escaped &&
+              !p.transitioning &&
+              (p.levelId == null || p.levelId === payload.levelId)
+          ).length
+        );
+        setMpPortalTotalCount(payload.players.length);
         setIsMultiplayerMatch(true);
         setPhase('playing');
         setIsTransitioningToPlay(false);
@@ -537,9 +525,19 @@ export default function App() {
         if (transitionTokenRef.current !== token) return;
         isPreparingMpRef.current = false;
         const localPlayer = payload.players.find((p) => p.userId === uid);
-        setMpLocalStatus(localPlayer?.escaped ? 'escaped' : localPlayer?.alive === false ? 'caught' : 'playing');
-        setMpAliveCount(payload.players.filter((p) => p.alive && !p.escaped).length);
-        setMpTotalCount(payload.players.length);
+        setMpLocalStatus(
+          localPlayer?.escaped ? 'escaped' : localPlayer?.alive === false ? 'caught' : 'playing'
+        );
+        setMpPortalReadyCount(
+          payload.players.filter(
+            (p) =>
+              p.alive &&
+              p.escaped &&
+              !p.transitioning &&
+              (p.levelId == null || p.levelId === payload.levelId)
+          ).length
+        );
+        setMpPortalTotalCount(payload.players.length);
         setPhase('playing');
         setIsTransitioningToPlay(false);
         mpClient.sendLevelReady(payload.levelId);
@@ -557,14 +555,20 @@ export default function App() {
         return;
       }
       engineRef.current?.applyMultiplayerWorld(world);
-      let aliveCount = 0;
-      for (let i = 0; i < world.players.length; i++) {
-        const p = world.players[i];
-        if (p.alive && !p.escaped) aliveCount++;
-      }
-      setMpAliveCount((prev) => (prev === aliveCount ? prev : aliveCount));
-      setMpTotalCount((prev) => (prev === world.players.length ? prev : world.players.length));
+      const readyCount =
+        typeof world.portalReadyCount === 'number'
+          ? world.portalReadyCount
+          : world.players.filter((p) => p.alive && p.escaped && !p.transitioning).length;
+      const totalCount =
+        typeof world.portalTotalCount === 'number'
+          ? world.portalTotalCount
+          : world.players.length;
+      setMpPortalReadyCount((prev) => (prev === readyCount ? prev : readyCount));
+      setMpPortalTotalCount((prev) => (prev === totalCount ? prev : totalCount));
       if (world.matchResult) {
+        if (world.matchResult.outcome === 'escaped' && activeLevelIdRef.current >= TOTAL_LEVELS) {
+          recordCompletedLevel(TOTAL_LEVELS, latestElapsedRef.current);
+        }
         setMpMatchResult((prev) => prev ?? world.matchResult!);
       }
     });
@@ -885,14 +889,6 @@ export default function App() {
           if (!cur.voiceActive) handleMasterVoiceToggle(true);
           void voiceMgr.enableMicrophone();
         }
-      } else if (
-        phase === 'playing' &&
-        isMpMatchRef.current &&
-        mpLocalStatusRef.current !== 'playing' &&
-        (e.code === 'KeyQ' || e.code === 'Tab')
-      ) {
-        e.preventDefault();
-        engineRef.current?.cycleSpectatorTarget(1);
       }
     };
     window.addEventListener('keydown', onKey);
@@ -982,16 +978,12 @@ export default function App() {
         />
       )}
 
-      {/* Multiplayer Spectator / Respawn / Escaped Banner */}
+      {/* Multiplayer Portal Waiting / Respawn Banner */}
       {isMultiplayerMatch && phase === 'playing' && !mpMatchResult && mpLocalStatus !== 'playing' && (
         <MultiplayerStatusPill
           status={mpLocalStatus}
-          aliveCount={mpAliveCount}
-          totalCount={mpTotalCount}
-          spectateName={mpSpectateInfo.targetName}
-          spectateLevelId={mpSpectateInfo.targetLevelId}
-          canCycleSpectator={mpSpectateInfo.canCycle}
-          onCycleSpectator={() => engineRef.current?.cycleSpectatorTarget(1)}
+          portalReadyCount={mpPortalReadyCount}
+          portalTotalCount={mpPortalTotalCount}
           onLeave={handleQuitToMenu}
         />
       )}

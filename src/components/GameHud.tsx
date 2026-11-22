@@ -164,6 +164,11 @@ export const GameHud: React.FC<GameHudProps> = React.memo(
               CP {hud.checkpointIndex}/{hud.totalCheckpoints}
             </div>
           )}
+          {hud.isMultiplayer && !hud.mpPortalWaiting && hud.mpPortalReadyCount > 0 && hud.mpPortalTotalCount > 0 && (
+            <div className="px-2 py-0.5 rounded bg-[#102923]/90 border border-[#4ef2b8]/75 text-[9px] sm:text-[10px] font-mono font-semibold text-[#9cf7d7] tracking-wider uppercase shadow">
+              AT PORTAL: {hud.mpPortalReadyCount}/{hud.mpPortalTotalCount} READY · REACH EXIT
+            </div>
+          )}
         </div>
 
         {/* Top-Right: Mouse Look Hint (desktop only) */}

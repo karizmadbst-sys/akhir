@@ -184,6 +184,8 @@ export interface WorldSyncPayload {
   serverTime: number;
   elapsedSec?: number;
   timeRemaining: number;
+  portalReadyCount?: number;
+  portalTotalCount?: number;
   players: PlayerNetState[];
   monsters: MonsterNetState[];
   matchResult: MatchResultSummary | null;

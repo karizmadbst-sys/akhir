@@ -52,7 +52,6 @@ interface InternalRoomPlayer extends RoomPlayerInfo {
   respawnAt: number;
   deaths: number;
   levelTimeRemaining: number;
-  spectateLevelId: number | null;
   x: number;
   y: number;
   z: number;
@@ -323,7 +322,6 @@ export class GameRoomDO {
       respawnAt: 0,
       deaths: 0,
       levelTimeRemaining: levelDef.timeLimit,
-      spectateLevelId: null,
       checkpointIndex: 0,
       x: levelDef.spawn[0],
       y: levelDef.spawn[1],
@@ -614,7 +612,7 @@ export class GameRoomDO {
         kind: 'left',
       };
       this.pushRoomBroadcast(batch, room, 'game:player_event', ev);
-      this.evaluateMatchResolution(room, batch);
+      this.evaluateTeamPortalProgression(room, Date.now(), batch);
     }
 
     if (this.room) {
@@ -1321,15 +1319,8 @@ export class GameRoomDO {
 
   private pruneEmptyLevelSims(room: InternalRoom): void {
     if (room.status !== 'playing') return;
-    const occupied = new Set<number>();
-    for (const p of room.players.values()) {
-      if (p.connected) {
-        occupied.add(p.levelId);
-        if (p.spectateLevelId !== null) occupied.add(p.spectateLevelId);
-      }
-    }
     for (const levelId of room.levelSims.keys()) {
-      if (!occupied.has(levelId)) {
+      if (levelId !== room.levelId) {
         room.levelSims.delete(levelId);
       }
     }
@@ -1378,96 +1369,143 @@ export class GameRoomDO {
     now: number,
     batch: RoomDeliveryBatch
   ): void {
-    if (p.transitioning || p.escaped) return;
-    const prevLevelId = p.levelId;
-    const oldSim = room.levelSims.get(prevLevelId);
-    if (oldSim) {
-      this.clearPlayerFromLevelMonsters(oldSim, p.userId);
-    }
+    if (room.status !== 'playing' || room.matchResult) return;
+    if (!p.connected || !p.alive || p.transitioning || p.escaped || p.levelId !== room.levelId) return;
 
-    if (prevLevelId < TOTAL_LEVELS) {
-      const nextLevelId = prevLevelId + 1;
-      const nextDef = getLevelDef(nextLevelId);
-      const nextSim = this.ensureLevelSim(room, nextLevelId);
-
-      p.levelId = nextLevelId;
-      p.transitioning = true;
-      p.transitioningUntil = now + LEVEL_TRANSITION_GRACE_MS;
-      p.checkpointIndex = 0;
-      p.alive = true;
-      p.escaped = false;
-      p.respawnAt = 0;
-      p.beingEatenUntil = 0;
-      p.beingEatenByMonsterId = null;
-      p.moveAttemptWhileWatched = false;
-      p.wasInWaterSession = false;
-      p.waterEpoch = 0;
-      p.pendingPlatformWatchEpoch = 0;
-      p.watchHandledEpoch = 0;
-      p.levelTimeRemaining = nextDef.timeLimit;
-      p.spectateLevelId = null;
-      p.pushImmunityUntil = now + 1200;
-      const sameLevelPeers = Array.from(room.players.values()).filter(
-        (pl) => pl.connected && pl.levelId === nextLevelId
-      );
-      this.placePlayerOnLevelSpawn(
-        nextDef,
-        p,
-        Math.max(0, sameLevelPeers.length - 1),
-        Math.max(1, sameLevelPeers.length)
-      );
-      p.lastUpdateAt = now;
-      this.dirtyPlayersSinceBroadcast = true;
-
-      this.pruneEmptyLevelSims(room);
-
-      const elapsedSec = room.matchStartTime ? Math.max(0, (now - room.matchStartTime) / 1000) : 0;
-      const levelChangePayload: GameLevelChangedPayload = {
-        roomId: room.id,
-        levelId: nextLevelId,
-        prevLevelId,
-        timeLimit: nextDef.timeLimit,
-        elapsedSec,
-        players: this.serializeNetPlayers(room),
-        monsters: this.serializeNetMonstersList(nextSim.monsters),
-      };
-      batch.deliveries.push({
-        targetUserId: p.userId,
-        event: 'game:level_changed',
-        payload: levelChangePayload,
-      });
-
-      const ev: GamePlayerEvent = {
-        userId: p.userId,
-        username: p.username,
-        kind: 'level_advanced',
-        levelId: nextLevelId,
-        prevLevelId,
-        x: p.x,
-        y: p.y,
-        z: p.z,
-      };
-      this.pushRoomBroadcast(batch, room, 'game:player_event', ev);
-      const summary = this.serializeRoom(room);
-      batch.roomSummary = summary;
-      this.pushRoomBroadcast(batch, room, 'room:state', summary);
-      return;
+    const curSim = room.levelSims.get(room.levelId);
+    if (curSim) {
+      this.clearPlayerFromLevelMonsters(curSim, p.userId);
     }
 
     p.escaped = true;
     p.inWater = false;
+    p.horizSpeed = 0;
+    p.velX = 0;
+    p.velY = 0;
+    p.velZ = 0;
+    p.animState = 'idle';
     p.beingEatenUntil = 0;
     p.beingEatenByMonsterId = null;
     p.moveAttemptWhileWatched = false;
+    p.wasInWaterSession = false;
+    p.waterEpoch = 0;
+    p.pendingPlatformWatchEpoch = 0;
+    p.watchHandledEpoch = 0;
+    p.lastUpdateAt = now;
     this.dirtyPlayersSinceBroadcast = true;
+
     const ev: GamePlayerEvent = {
       userId: p.userId,
       username: p.username,
       kind: 'escaped',
       levelId: currentDef.id,
+      x: r3(p.x),
+      y: r3(p.y),
+      z: r3(p.z),
     };
     this.pushRoomBroadcast(batch, room, 'game:player_event', ev);
-    this.evaluateMatchResolution(room, batch);
+    const summary = this.serializeRoom(room);
+    batch.roomSummary = summary;
+    this.pushRoomBroadcast(batch, room, 'room:state', summary);
+    this.evaluateTeamPortalProgression(room, now, batch, p);
+  }
+
+  private evaluateTeamPortalProgression(
+    room: InternalRoom,
+    now: number,
+    batch: RoomDeliveryBatch,
+    triggeringPlayer?: InternalRoomPlayer
+  ): void {
+    if (room.status !== 'playing' || room.matchResult) return;
+
+    let connectedCount = 0;
+    let readyCount = 0;
+    const totalCount = room.players.size;
+    for (const pl of room.players.values()) {
+      if (pl.connected) connectedCount++;
+      if (pl.connected && pl.alive && pl.escaped && !pl.transitioning && pl.levelId === room.levelId) {
+        readyCount++;
+      }
+    }
+
+    if (connectedCount === 0 || totalCount === 0) {
+      this.finalizeMatch(room, 'all_caught', batch);
+      return;
+    }
+
+    if (readyCount < totalCount) {
+      return;
+    }
+
+    const prevLevelId = room.levelId;
+    if (prevLevelId >= TOTAL_LEVELS) {
+      this.finalizeMatch(room, 'all_resolved', batch);
+      return;
+    }
+
+    const nextLevelId = prevLevelId + 1;
+    const nextDef = getLevelDef(nextLevelId);
+    room.levelSims.clear();
+    room.levelId = nextLevelId;
+    room.levelDef = nextDef;
+    room.timeRemaining = nextDef.timeLimit;
+
+    const nextSim = this.ensureLevelSim(room, nextLevelId);
+    room.monsters = nextSim.monsters;
+
+    const allPlayers = Array.from(room.players.values());
+    allPlayers.forEach((pl, idx) => {
+      pl.levelId = nextLevelId;
+      pl.transitioning = true;
+      pl.transitioningUntil = now + LEVEL_TRANSITION_GRACE_MS;
+      pl.checkpointIndex = 0;
+      pl.alive = true;
+      pl.escaped = false;
+      pl.respawnAt = 0;
+      pl.beingEatenUntil = 0;
+      pl.beingEatenByMonsterId = null;
+      pl.moveAttemptWhileWatched = false;
+      pl.wasInWaterSession = false;
+      pl.waterEpoch = 0;
+      pl.pendingPlatformWatchEpoch = 0;
+      pl.watchHandledEpoch = 0;
+      pl.levelTimeRemaining = nextDef.timeLimit;
+      pl.pushImmunityUntil = now + 1200;
+      this.placePlayerOnLevelSpawn(nextDef, pl, idx, allPlayers.length);
+      pl.lastUpdateAt = now;
+    });
+    this.dirtyPlayersSinceBroadcast = true;
+
+    const elapsedSec = room.matchStartTime ? Math.max(0, (now - room.matchStartTime) / 1000) : 0;
+    const levelChangePayload: GameLevelChangedPayload = {
+      roomId: room.id,
+      levelId: nextLevelId,
+      prevLevelId,
+      timeLimit: nextDef.timeLimit,
+      elapsedSec,
+      players: this.serializeNetPlayers(room),
+      monsters: this.serializeNetMonstersList(nextSim.monsters),
+    };
+    this.pushRoomBroadcast(batch, room, 'game:level_changed', levelChangePayload);
+
+    const actor = triggeringPlayer || allPlayers.find((pl) => pl.userId === room.hostId) || allPlayers[0];
+    if (actor) {
+      const advEv: GamePlayerEvent = {
+        userId: actor.userId,
+        username: actor.username,
+        kind: 'level_advanced',
+        levelId: nextLevelId,
+        prevLevelId,
+        x: r3(actor.x),
+        y: r3(actor.y),
+        z: r3(actor.z),
+      };
+      this.pushRoomBroadcast(batch, room, 'game:player_event', advEv);
+    }
+
+    const summary = this.serializeRoom(room);
+    batch.roomSummary = summary;
+    this.pushRoomBroadcast(batch, room, 'room:state', summary);
   }
 
   private respawnPlayerAtLevelStart(
@@ -1476,12 +1514,13 @@ export class GameRoomDO {
     now: number,
     batch: RoomDeliveryBatch
   ): void {
-    const def = getLevelDef(p.levelId);
-    const sim = this.ensureLevelSim(room, p.levelId);
+    p.levelId = room.levelId;
+    const def = getLevelDef(room.levelId);
+    const sim = this.ensureLevelSim(room, room.levelId);
     this.clearPlayerFromLevelMonsters(sim, p.userId);
 
     const peersOnLevel = Array.from(room.players.values()).filter(
-      (pl) => pl.connected && pl.levelId === p.levelId
+      (pl) => pl.connected && pl.levelId === room.levelId
     );
     const slotIdx = Math.max(0, peersOnLevel.findIndex((pl) => pl.userId === p.userId));
     this.placePlayerOnLevelSpawn(def, p, slotIdx, Math.max(1, peersOnLevel.length));
@@ -1508,7 +1547,7 @@ export class GameRoomDO {
       userId: p.userId,
       username: p.username,
       kind: 'respawned',
-      levelId: p.levelId,
+      levelId: room.levelId,
       x: r3(p.x),
       y: r3(p.y),
       z: r3(p.z),
@@ -2512,24 +2551,7 @@ export class GameRoomDO {
   }
 
   private evaluateMatchResolution(room: InternalRoom, batch: RoomDeliveryBatch): void {
-    if (room.status !== 'playing' || room.matchResult) return;
-
-    let activeCount = 0;
-    let notEscapedCount = 0;
-    for (const p of room.players.values()) {
-      if (!p.connected) continue;
-      activeCount++;
-      if (!p.escaped) notEscapedCount++;
-    }
-
-    if (activeCount === 0) {
-      this.finalizeMatch(room, 'all_caught', batch);
-      return;
-    }
-
-    if (notEscapedCount === 0) {
-      this.finalizeMatch(room, 'all_resolved', batch);
-    }
+    this.evaluateTeamPortalProgression(room, Date.now(), batch);
   }
 
   private finalizeMatch(
@@ -2568,6 +2590,37 @@ export class GameRoomDO {
         m.eatingUntil = 0;
         m.eatingProgress = 0;
       }
+    }
+    const now = Date.now();
+    const elapsedSec = room.matchStartTime ? r2(Math.max(0, (now - room.matchStartTime) / 1000)) : 0;
+    const netPlayers = this.serializeNetPlayers(room, true);
+    const sim = room.levelSims.get(room.levelId);
+    const monsters = sim ? this.serializeNetMonstersList(sim.monsters) : [];
+    const portalTotalCount = room.players.size;
+    let portalReadyCount = 0;
+    for (const pl of room.players.values()) {
+      if (pl.connected && pl.alive && pl.escaped && !pl.transitioning && pl.levelId === room.levelId) {
+        portalReadyCount++;
+      }
+    }
+    for (const p of room.players.values()) {
+      if (!p.connected) continue;
+      batch.deliveries.push({
+        targetUserId: p.userId,
+        event: 'game:world',
+        payload: {
+          roomId: room.id,
+          levelId: room.levelId,
+          serverTime: now,
+          timeRemaining: r2(p.levelTimeRemaining),
+          elapsedSec,
+          portalReadyCount,
+          portalTotalCount,
+          players: netPlayers,
+          monsters,
+          matchResult: room.matchResult,
+        },
+      });
     }
     const summary = this.serializeRoom(room);
     batch.roomSummary = summary;
@@ -2635,7 +2688,7 @@ export class GameRoomDO {
         this.updateLevelSimMonsters(room, sim, dt, now, batch);
       }
 
-      this.evaluateMatchResolution(room, batch);
+      this.evaluateTeamPortalProgression(room, now, batch);
       if (anyStateChanged && room.status === 'playing') {
         const summary = this.serializeRoom(room);
         batch.roomSummary = summary;
@@ -2643,30 +2696,35 @@ export class GameRoomDO {
       }
     }
 
+    if (room.status !== 'playing' && !room.matchResult) return;
+
     if (forceBroadcast || this.dirtyPlayersSinceBroadcast || now - this.lastWorldBroadcastMs >= 36) {
       this.lastWorldBroadcastMs = now;
       this.dirtyPlayersSinceBroadcast = false;
       const elapsedSec = room.matchStartTime ? r2(Math.max(0, (now - room.matchStartTime) / 1000)) : 0;
       const netPlayers = this.serializeNetPlayers(room, true);
-      const monstersCache = new Map<number, MonsterNetState[]>();
+      const sim = room.levelSims.get(room.levelId);
+      const monsters = sim ? this.serializeNetMonstersList(sim.monsters) : [];
+      const portalTotalCount = room.players.size;
+      let portalReadyCount = 0;
+      for (const pl of room.players.values()) {
+        if (pl.connected && pl.alive && pl.escaped && !pl.transitioning && pl.levelId === room.levelId) {
+          portalReadyCount++;
+        }
+      }
       for (const p of room.players.values()) {
         if (!p.connected) continue;
-        const viewLevelId = p.spectateLevelId ?? p.levelId;
-        let monsters = monstersCache.get(viewLevelId);
-        if (!monsters) {
-          const sim = room.levelSims.get(viewLevelId);
-          monsters = sim ? this.serializeNetMonstersList(sim.monsters) : [];
-          monstersCache.set(viewLevelId, monsters);
-        }
         batch.deliveries.push({
           targetUserId: p.userId,
           event: 'game:world',
           payload: {
             roomId: room.id,
-            levelId: viewLevelId,
+            levelId: room.levelId,
             serverTime: now,
             timeRemaining: r2(p.levelTimeRemaining),
             elapsedSec,
+            portalReadyCount,
+            portalTotalCount,
             players: netPlayers,
             monsters,
             matchResult: room.matchResult,
@@ -2818,10 +2876,10 @@ export class GameRoomDO {
             this.pushRoomBroadcast(batch, room, 'room:state', serialized);
             let gameStarted: Record<string, unknown> | null = null;
             if (room.status === 'playing') {
-              const sim = this.ensureLevelSim(room, rp.levelId);
+              const sim = this.ensureLevelSim(room, room.levelId);
               gameStarted = {
                 roomId: room.id,
-                levelId: rp.levelId,
+                levelId: room.levelId,
                 timeLimit: rp.levelTimeRemaining,
                 elapsedSec: room.matchStartTime
                   ? Math.max(0, (Date.now() - room.matchStartTime) / 1000)
@@ -3019,7 +3077,6 @@ export class GameRoomDO {
             p.respawnAt = 0;
             p.deaths = 0;
             p.levelTimeRemaining = def.timeLimit;
-            p.spectateLevelId = null;
             this.placePlayerOnLevelSpawn(def, p, idx, playerList.length);
             p.alive = true;
             p.escaped = false;
@@ -3094,7 +3151,6 @@ export class GameRoomDO {
             p.respawnAt = 0;
             p.deaths = 0;
             p.levelTimeRemaining = room.levelDef.timeLimit;
-            p.spectateLevelId = null;
             p.alive = true;
             p.escaped = false;
             p.checkpointIndex = 0;
@@ -3136,40 +3192,24 @@ export class GameRoomDO {
 
         case 'portal_enter': {
           const room = this.room;
-          if (!room || room.status !== 'playing') return Response.json({ batch });
+          if (!room || room.status !== 'playing' || room.matchResult) return Response.json({ batch });
           const userId = String(body.userId || '');
           const p = room.players.get(userId);
           const now = Date.now();
-          if (!p || !p.alive || p.escaped || p.transitioning || (p.beingEatenUntil && now < p.beingEatenUntil)) {
+          if (!p || !p.connected || !p.alive || p.escaped || p.transitioning || (p.beingEatenUntil && now < p.beingEatenUntil)) {
             return Response.json({ batch });
           }
           const reportedLevelId = typeof body.levelId === 'number' ? body.levelId : undefined;
-          if (typeof reportedLevelId === 'number' && Number.isFinite(reportedLevelId) && reportedLevelId !== p.levelId) {
+          if (typeof reportedLevelId === 'number' && Number.isFinite(reportedLevelId) && reportedLevelId !== room.levelId) {
             return Response.json({ batch });
           }
-          const def = getLevelDef(p.levelId);
+          p.levelId = room.levelId;
+          const def = getLevelDef(room.levelId);
           const ex = def.exit.position;
           const dist = Math.hypot(p.x - ex[0], p.z - ex[2]);
           if (dist <= 4.5 && Math.abs(p.y - ex[1]) <= 3.5) {
             this.handlePlayerReachedPortal(room, p, def, now, batch);
           }
-          return Response.json({ batch });
-        }
-
-        case 'spectate': {
-          const room = this.room;
-          if (!room || room.status !== 'playing') return Response.json({ batch });
-          const userId = String(body.userId || '');
-          const p = room.players.get(userId);
-          if (!p) return Response.json({ batch });
-          const targetLevelId = typeof body.levelId === 'number' ? body.levelId : null;
-          if (targetLevelId === null || !isValidLevelId(targetLevelId)) {
-            p.spectateLevelId = null;
-          } else {
-            p.spectateLevelId = targetLevelId;
-            this.ensureLevelSim(room, targetLevelId);
-          }
-          this.pruneEmptyLevelSims(room);
           return Response.json({ batch });
         }
 
@@ -3188,8 +3228,15 @@ export class GameRoomDO {
             packet &&
             typeof packet.levelId === 'number' &&
             Number.isFinite(packet.levelId) &&
-            packet.levelId !== p.levelId
+            packet.levelId !== room.levelId
           ) {
+            return Response.json({ batch });
+          }
+          if (p.escaped) {
+            if (packet?.characterId !== undefined) {
+              p.characterId = normalizeCharacterId(packet.characterId);
+            }
+            p.lastUpdateAt = now;
             return Response.json({ batch });
           }
           if (!packet || !Number.isFinite(packet.x) || !Number.isFinite(packet.y) || !Number.isFinite(packet.z)) {
@@ -3201,7 +3248,7 @@ export class GameRoomDO {
             p.transitioningUntil = 0;
           }
 
-          const levelDef = getLevelDef(p.levelId);
+          const levelDef = getLevelDef(room.levelId);
           const prevX = p.x;
           const prevY = p.y;
           const prevZ = p.z;

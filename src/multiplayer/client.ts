@@ -604,11 +604,6 @@ export class MultiplayerClient {
     this.ws.send(JSON.stringify({ event: 'game:portal_enter', payload: { levelId } }));
   }
 
-  public sendSpectateLevel(levelId: number | null): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ event: 'game:spectate', payload: { levelId } }));
-  }
-
   public sendPush(packet: ClientPushPacket): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ event: 'game:push', payload: packet }));

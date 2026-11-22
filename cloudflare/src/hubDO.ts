@@ -687,13 +687,6 @@ export class PresenceHubDO {
           await this.callRoomAction(info.roomId, { action: 'portal_enter', userId, levelId });
           break;
         }
-        case 'game:spectate': {
-          const info = this.userRoom.get(userId);
-          if (!info) break;
-          const levelId = typeof payload.levelId === 'number' ? payload.levelId : null;
-          await this.callRoomAction(info.roomId, { action: 'spectate', userId, levelId });
-          break;
-        }
         case 'game:push': {
           const info = this.userRoom.get(userId);
           if (!info) break;

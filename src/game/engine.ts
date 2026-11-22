@@ -359,14 +359,6 @@ export interface EngineCallbacks {
   onMultiplayerRespawned?: () => void;
   onMultiplayerEscaped?: () => void;
   onMultiplayerPortalEnter?: (levelId: number) => void;
-  onMultiplayerSpectateLevel?: (levelId: number) => void;
-  onMultiplayerSpectatorChange?: (info: {
-    spectating: boolean;
-    targetUserId: string | null;
-    targetName: string | null;
-    targetLevelId: number | null;
-    canCycle: boolean;
-  }) => void;
 }
 
 interface RemotePlayerVisual {
@@ -637,6 +629,9 @@ export class PoolGameEngine {
     isPointerLocked: false,
     deathReason: null as string | null,
     isMultiplayer: false,
+    mpPortalWaiting: false,
+    mpPortalReadyCount: -1,
+    mpPortalTotalCount: -1,
     pushCooldown: -1,
     canPushTarget: false,
   };
@@ -649,15 +644,8 @@ export class PoolGameEngine {
   private mpLocalEscaped = false;
   private mpLocalTransitioning = false;
   private mpTransitionRequestedAt = 0;
-  private mpSpectateUserId: string | null = null;
-  private mpSpectatedPos = new THREE.Vector3();
-  private mpSpectatedInWater = false;
-  private mpLastSpectating = false;
-  private mpLastSpectateTargetId: string | null = null;
-  private mpLastSpectateName: string | null = null;
-  private mpLastSpectateLevel: number | null = null;
-  private mpLastSpectateCanCycle = false;
-  private mpLastServerSpectateLevel: number | null = null;
+  private mpPortalReadyCount = 0;
+  private mpPortalTotalCount = 0;
   private mpLastAnimState: PlayerAnimState = 'idle';
   private mpLastHorizSpeed = 0;
   private mpSendTimer = 0;
@@ -668,6 +656,7 @@ export class PoolGameEngine {
   private mpLastSentYaw = NaN;
   private mpLastSentInWater = false;
   private mpLastSentCp = -1;
+  private mpLastSentEscaped = false;
   private mpLastSentAnim: PlayerAnimState = 'idle';
   private mpLastSentCharacter: CharacterId = 'male';
   private remotePlayers = new Map<string, RemotePlayerVisual>();
@@ -930,10 +919,10 @@ export class PoolGameEngine {
   }
 
   private isLocalFirstPersonActive(): boolean {
-    const spectating = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
+    const waitingAtPortalOrDead = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
     return (
       !this.isThirdPersonView() &&
-      !spectating &&
+      !waitingAtPortalOrDead &&
       (this.phase === 'playing' || this.phase === 'paused') &&
       !this.mpLocalBeingEaten
     );
@@ -964,7 +953,7 @@ export class PoolGameEngine {
     const shouldBeVisible =
       (this.phase === 'playing' || this.phase === 'paused') &&
       !this.mpLocalBeingEaten &&
-      (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped));
+      (!this.isMultiplayer || this.mpLocalAlive);
     if (!shouldBeVisible) return;
 
     if (this.playerRig.root.parent !== this.scene) {
@@ -1302,7 +1291,7 @@ export class PoolGameEngine {
     const wasVisible = prevRig.root.visible && prevRig.hips.visible;
     const shouldBeVisible =
       this.phase === 'playing'
-        ? !this.mpLocalBeingEaten && (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped))
+        ? !this.mpLocalBeingEaten && (!this.isMultiplayer || this.mpLocalAlive)
         : wasVisible;
     const pos = prevRig.root.position.clone();
     const rot = prevRig.root.rotation.clone();
@@ -1416,7 +1405,7 @@ export class PoolGameEngine {
     if (this.disposed || this.contextLost) return;
     if (this.phase === 'playing') {
       this.overlayOccluded = false;
-      const shouldShowLocal = !this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped);
+      const shouldShowLocal = !this.isMultiplayer || this.mpLocalAlive;
       this.playerRig.setVisible(shouldShowLocal);
       this.ensureLocalPlayerVisible();
       this.syncLocalPlayerRigTransform(this.mpLastAnimState, this.mpLastHorizSpeed);
@@ -1519,8 +1508,10 @@ export class PoolGameEngine {
     this.mpLocalEscaped = false;
     this.mpLocalTransitioning = false;
     this.mpTransitionRequestedAt = 0;
-    this.mpSpectateUserId = null;
-    this.mpLastServerSpectateLevel = levelId;
+    this.mpPortalReadyCount = initialPlayers.filter(
+      (p) => p.alive && p.escaped && !p.transitioning && (p.levelId == null || p.levelId === levelId)
+    ).length;
+    this.mpPortalTotalCount = initialPlayers.length;
     this.mpTriggeredDeathIds.clear();
     this.mpLastAnimState = 'idle';
     this.mpLastHorizSpeed = 0;
@@ -1563,7 +1554,7 @@ export class PoolGameEngine {
     }
     this.groundPlayerOnSpawnPlatform();
     resetPlayerRigPose(this.playerRig);
-    this.playerRig.setVisible(this.mpLocalAlive && !this.mpLocalEscaped);
+    this.playerRig.setVisible(this.mpLocalAlive);
     this.ensureLocalPlayerVisible();
     this.syncLocalPlayerRigTransform('idle', 0);
 
@@ -1572,7 +1563,6 @@ export class PoolGameEngine {
         this.upsertRemotePlayer(p);
       }
     }
-    this.syncSpectatorState(true);
     this.snapPlayCameraImmediate();
     this.syncMonstersFromServer(initialMonsters);
     for (const m of this.monsters) {
@@ -1587,6 +1577,7 @@ export class PoolGameEngine {
     this.mpLastSentY = NaN;
     this.mpLastSentZ = NaN;
     this.mpLastSentCp = -1;
+    this.mpLastSentEscaped = this.mpLocalEscaped;
     this.prewarmSceneShaders();
     this.renderImmediateReadyFrame();
   }
@@ -1664,9 +1655,9 @@ export class PoolGameEngine {
     this.mpLocalEscaped = false;
     this.mpLocalTransitioning = false;
     this.mpTransitionRequestedAt = 0;
-    this.mpSpectateUserId = null;
-    this.mpLastServerSpectateLevel = null;
-    this.emitSpectatorChangeIfNeeded(false, null, null, null, false);
+    this.mpPortalReadyCount = 0;
+    this.mpPortalTotalCount = 0;
+    this.mpLastSentEscaped = false;
     this.mpTriggeredDeathIds.clear();
     this.pushCooldownTimer = 0;
     this.pushRecoveryTimer = 0;
@@ -1865,6 +1856,18 @@ export class PoolGameEngine {
       this.handleMultiplayerRespawned(ev);
     } else if (ev.kind === 'level_advanced') {
       this.handleMultiplayerLevelAdvanced(ev);
+    } else if (ev.kind === 'escaped' && ev.userId !== this.mpLocalUserId) {
+      const rp = this.remotePlayers.get(ev.userId);
+      if (rp) {
+        rp.escaped = true;
+        rp.velX = 0;
+        rp.velY = 0;
+        rp.velZ = 0;
+        rp.horizSpeed = 0;
+        rp.animState = 'idle';
+        rp.rig.setVisible(rp.alive && rp.levelId === this.currentLevel.id);
+      }
+      this.emitHud(true);
     }
   }
 
@@ -1955,7 +1958,7 @@ export class PoolGameEngine {
     this.mpLocalEscaped = false;
     this.mpLocalTransitioning = false;
     this.mpTransitionRequestedAt = 0;
-    this.mpSpectateUserId = null;
+    this.mpLastSentEscaped = false;
     this.deathReason = null;
     this.jumpscareMonster = null;
     this.jumpscareTimer = 0;
@@ -2016,13 +2019,13 @@ export class PoolGameEngine {
     this.playerRig.setVisible(true);
     this.respawnAtActiveCheckpoint(true);
     this.groundPlayerOnSpawnPlatform();
-    this.syncSpectatorState(true);
     this.snapPlayCameraImmediate();
     this.mpLastSentTime = 0;
     this.mpLastSentX = NaN;
     this.mpLastSentY = NaN;
     this.mpLastSentZ = NaN;
     this.mpLastSentCp = -1;
+    this.mpLastSentEscaped = false;
     this.callbacks.onPhaseChange('playing');
     this.callbacks.onMultiplayerRespawned?.();
     this.emitHud(true);
@@ -2338,13 +2341,13 @@ export class PoolGameEngine {
         this.callbacks.onMultiplayerCaught?.();
 
         if (wasInEatingView) {
-          // Eating already played cleanly -> transition directly to spectating teammates
+          // Eating completed cleanly -> hold brief respawn view on current sector while server respawns player
           this.jumpscareMonster = null;
           this.jumpscareTimer = 0;
           this.phase = 'playing';
           this.resetHorrorVisualState();
           this.callbacks.onPhaseChange('playing');
-          this.emitHud();
+          this.emitHud(true);
         } else {
           // Fallback if caught arrived without eating_started (e.g. reconnect right at end)
           const refX = x ?? this.playerPos.x;
@@ -2400,21 +2403,26 @@ export class PoolGameEngine {
       }
     }
 
+    let readyCount = 0;
     _seenRemoteIds.clear();
     for (const p of world.players) {
+      const pLevel = typeof p.levelId === 'number' ? p.levelId : this.currentLevel.id;
+      if (p.alive && p.escaped && !p.transitioning && pLevel === this.currentLevel.id) {
+        readyCount++;
+      }
       if (p.userId === this.mpLocalUserId) {
-        const pLevel = typeof p.levelId === 'number' ? p.levelId : this.currentLevel.id;
         if (this.mpLocalTransitioning && performance.now() - this.mpTransitionRequestedAt > 1500 && !p.transitioning && pLevel === this.currentLevel.id) {
           this.mpLocalTransitioning = false;
         }
-        if (pLevel === this.currentLevel.id && !this.mpLocalEscaped) {
+        if (pLevel === this.currentLevel.id) {
           if (!p.alive && this.mpLocalAlive) {
             this.handleMultiplayerCaught(p.userId, p.x, p.y, p.z);
           } else if (p.alive && !this.mpLocalAlive && !this.mpLocalBeingEaten && !this.mpLocalTransitioning) {
             this.respawnMultiplayerSameLevel(p.x, p.y, p.z, p.yaw, pLevel);
           }
-          if (p.escaped && !this.mpLocalEscaped && this.currentLevel.id >= TOTAL_LEVELS) {
+          if (p.escaped && !this.mpLocalEscaped) {
             this.mpLocalEscaped = true;
+            this.playerVel.set(0, 0, 0);
             this.sound.playVictory();
             this.callbacks.onMultiplayerEscaped?.();
           }
@@ -2423,7 +2431,6 @@ export class PoolGameEngine {
         _seenRemoteIds.add(p.userId);
         const existing = this.remotePlayers.get(p.userId);
         const prevAlive = existing?.alive ?? true;
-        const pLevel = typeof p.levelId === 'number' ? p.levelId : this.currentLevel.id;
         this.upsertRemotePlayer(p);
         if (!p.alive && prevAlive && pLevel === this.currentLevel.id) {
           this.handleMultiplayerCaught(p.userId, p.x, p.y, p.z);
@@ -2433,6 +2440,11 @@ export class PoolGameEngine {
       }
     }
 
+    this.mpPortalReadyCount =
+      typeof world.portalReadyCount === 'number' ? world.portalReadyCount : readyCount;
+    this.mpPortalTotalCount =
+      typeof world.portalTotalCount === 'number' ? world.portalTotalCount : world.players.length;
+
     for (const [uid, rp] of this.remotePlayers.entries()) {
       if (!_seenRemoteIds.has(uid)) {
         this.disposeRemotePlayer(rp);
@@ -2441,6 +2453,7 @@ export class PoolGameEngine {
     }
 
     this.syncMonstersFromServer(world.monsters);
+    this.emitHud();
   }
 
   private upsertRemotePlayer(p: PlayerNetState): void {
@@ -2564,10 +2577,10 @@ export class PoolGameEngine {
       }
     }
     if (eatingMonster) {
-      rp.rig.setVisible(!p.escaped && eatingMonster.eatingProgress < 0.995);
+      rp.rig.setVisible(eatingMonster.eatingProgress < 0.995);
     } else {
       rp.rig.root.scale.setScalar(1);
-      rp.rig.setVisible(p.alive && !p.escaped);
+      rp.rig.setVisible(p.alive);
     }
   }
 
@@ -3212,7 +3225,7 @@ export class PoolGameEngine {
     }
 
     this.groundPlayerOnSpawnPlatform();
-    const shouldShowLocal = nextPhase !== 'menu' && (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped));
+    const shouldShowLocal = nextPhase !== 'menu' && (!this.isMultiplayer || this.mpLocalAlive);
     resetPlayerRigPose(this.playerRig);
     this.playerRig.setVisible(shouldShowLocal);
     this.ensureLocalPlayerVisible();
@@ -5095,7 +5108,7 @@ export class PoolGameEngine {
     }
     resetPlayerRigPose(this.playerRig);
     const shouldShowLocal =
-      this.phase !== 'menu' && (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped));
+      this.phase !== 'menu' && (!this.isMultiplayer || this.mpLocalAlive);
     this.playerRig.setVisible(shouldShowLocal);
     this.ensureLocalPlayerVisible();
     this.syncLocalPlayerRigTransform('idle', 0);
@@ -5342,10 +5355,20 @@ export class PoolGameEngine {
       this.levelTimeElapsed += dt;
       if (this.isMultiplayer) {
         this.updatePlatforms(dt);
-        if (this.mpLocalAlive && !this.mpLocalBeingEaten && !this.mpLocalEscaped && !this.mpLocalTransitioning) {
-          this.updatePlayer(dt);
-          this.updateCheckpoints(dt);
-          this.checkExit();
+        if (this.mpLocalAlive && !this.mpLocalBeingEaten && !this.mpLocalTransitioning) {
+          if (!this.mpLocalEscaped) {
+            this.updatePlayer(dt);
+            this.updateCheckpoints(dt);
+            this.checkExit();
+          } else {
+            this.playerVel.set(0, 0, 0);
+            this.mpLastAnimState = 'idle';
+            this.mpLastHorizSpeed = 0;
+            this.ensureLocalPlayerVisible();
+            this.playerRig.root.position.copy(this.playerPos);
+            this.playerRig.root.rotation.set(0, this.playerYaw, 0);
+            animatePlayerRig(this.playerRig, 'idle', 0, this.simTime, dt);
+          }
         }
         this.updateRemotePlayers(dt);
         this.updateMultiplayerMonsters(dt);
@@ -5359,7 +5382,7 @@ export class PoolGameEngine {
             this.activeCheckpointIndex !== this.mpLastSentCp ||
             this.localCharacterId !== this.mpLastSentCharacter ||
             this.watchMoveAttempted !== this.mpLastSentMoveAttempt ||
-            this.mpLocalEscaped;
+            this.mpLocalEscaped !== this.mpLastSentEscaped;
           if (urgentTransition || this.mpSendTimer >= 0.04) {
             this.mpSendTimer = 0;
             const qx = Math.round(this.playerPos.x * 1000) / 1000;
@@ -5386,6 +5409,7 @@ export class PoolGameEngine {
               this.mpLastSentAnim = this.mpLastAnimState;
               this.mpLastSentInWater = this.inWater;
               this.mpLastSentCp = this.activeCheckpointIndex;
+              this.mpLastSentEscaped = this.mpLocalEscaped;
               this.mpLastSentCharacter = this.localCharacterId;
               this.mpLastSentMoveAttempt = this.watchMoveAttempted;
               this.callbacks.onMultiplayerTick?.({
@@ -5535,7 +5559,7 @@ export class PoolGameEngine {
       this.scene.background.lerp(targetColor, kFog);
     }
 
-    // Follow active camera focus (player, spectated teammate, or devouring serpent) with shadow-casting moonlight
+    // Follow active camera focus (local player or devouring serpent) with shadow-casting moonlight
     if (this.keyLight) {
       const focusPos = this.getCameraFocusPos();
       const focusX =
@@ -6728,145 +6752,7 @@ export class PoolGameEngine {
     animatePlayerRig(this.playerRig, animState, horizSpeed, this.simTime, dt);
   }
 
-  private emitSpectatorChangeIfNeeded(
-    spectating: boolean,
-    targetUserId: string | null,
-    targetName: string | null,
-    targetLevelId: number | null,
-    canCycle: boolean
-  ): void {
-    if (
-      this.mpLastSpectating === spectating &&
-      this.mpLastSpectateTargetId === targetUserId &&
-      this.mpLastSpectateName === targetName &&
-      this.mpLastSpectateLevel === targetLevelId &&
-      this.mpLastSpectateCanCycle === canCycle
-    ) {
-      return;
-    }
-    this.mpLastSpectating = spectating;
-    this.mpLastSpectateTargetId = targetUserId;
-    this.mpLastSpectateName = targetName;
-    this.mpLastSpectateLevel = targetLevelId;
-    this.mpLastSpectateCanCycle = canCycle;
-    this.callbacks?.onMultiplayerSpectatorChange?.({
-      spectating,
-      targetUserId,
-      targetName,
-      targetLevelId,
-      canCycle,
-    });
-  }
-
-  private getSpectatedRemotePlayer(): RemotePlayerVisual | null {
-    if (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped)) {
-      return null;
-    }
-    const allowCrossLevel = this.mpLocalEscaped;
-    if (this.mpSpectateUserId) {
-      const cur = this.remotePlayers.get(this.mpSpectateUserId);
-      if (
-        cur &&
-        cur.alive &&
-        !cur.escaped &&
-        !cur.transitioning &&
-        (allowCrossLevel || cur.levelId === this.currentLevel.id)
-      ) {
-        return cur;
-      }
-    }
-    // Prefer alive non-transitioning teammate on the current level first
-    for (const rp of this.remotePlayers.values()) {
-      if (rp.alive && !rp.escaped && !rp.transitioning && rp.levelId === this.currentLevel.id) {
-        return rp;
-      }
-    }
-    if (allowCrossLevel) {
-      for (const rp of this.remotePlayers.values()) {
-        if (rp.alive && !rp.escaped && !rp.transitioning) {
-          return rp;
-        }
-      }
-    }
-    return null;
-  }
-
-  public cycleSpectatorTarget(dir = 1): void {
-    if (!this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped)) return;
-    const allowCrossLevel = this.mpLocalEscaped;
-    const candidates: RemotePlayerVisual[] = [];
-    for (const rp of this.remotePlayers.values()) {
-      if (!rp.alive || rp.escaped || rp.transitioning) continue;
-      if (!allowCrossLevel && rp.levelId !== this.currentLevel.id) continue;
-      candidates.push(rp);
-    }
-    if (candidates.length === 0) return;
-    const idx = this.mpSpectateUserId
-      ? candidates.findIndex((c) => c.userId === this.mpSpectateUserId)
-      : -1;
-    const nextIdx =
-      idx === -1
-        ? 0
-        : (idx + (dir >= 0 ? 1 : candidates.length - 1)) % candidates.length;
-    this.mpSpectateUserId = candidates[nextIdx].userId;
-    this.syncSpectatorState(true);
-    this.emitHud(true);
-  }
-
-  private syncSpectatorState(allowLevelNotify = false): void {
-    if (!this.mpSpectatedPos) {
-      this.mpSpectatedPos = new THREE.Vector3();
-    }
-    const spectating = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
-    if (!spectating) {
-      this.mpSpectateUserId = null;
-      this.mpSpectatedPos.copy(this.playerPos);
-      this.mpSpectatedInWater = this.inWater;
-      this.emitSpectatorChangeIfNeeded(false, null, null, null, false);
-      return;
-    }
-
-    const allowCrossLevel = this.mpLocalEscaped;
-    let eligibleCount = 0;
-    for (const rp of this.remotePlayers.values()) {
-      if (!rp.alive || rp.escaped || rp.transitioning) continue;
-      if (!allowCrossLevel && rp.levelId !== this.currentLevel.id) continue;
-      eligibleCount++;
-    }
-
-    const target = this.getSpectatedRemotePlayer();
-    if (target) {
-      this.mpSpectateUserId = target.userId;
-      this.mpSpectatedPos.copy(target.pos);
-      this.mpSpectatedInWater = target.inWater;
-      this.emitSpectatorChangeIfNeeded(
-        true,
-        target.userId,
-        target.username,
-        target.levelId,
-        eligibleCount > 1
-      );
-      if (
-        allowLevelNotify &&
-        allowCrossLevel &&
-        target.levelId !== this.currentLevel.id &&
-        target.levelId !== this.mpLastServerSpectateLevel
-      ) {
-        this.mpLastServerSpectateLevel = target.levelId;
-        this.callbacks?.onMultiplayerSpectateLevel?.(target.levelId);
-      }
-    } else {
-      this.mpSpectateUserId = null;
-      this.mpSpectatedPos.copy(this.playerPos);
-      this.mpSpectatedInWater = false;
-      this.emitSpectatorChangeIfNeeded(true, null, null, null, false);
-    }
-  }
-
   private getCameraFocusPos(): THREE.Vector3 {
-    if (this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped) && this.mpSpectateUserId) {
-      return this.mpSpectatedPos ?? this.playerPos;
-    }
     return this.playerPos;
   }
 
@@ -6893,7 +6779,7 @@ export class PoolGameEngine {
         // Position & pose are driven directly by attachPreyToSerpentMouth
         continue;
       }
-      if (!rp.alive || rp.escaped) {
+      if (!rp.alive) {
         rp.rig.setVisible(false);
         rp.nameplate.visible = false;
         continue;
@@ -6937,7 +6823,7 @@ export class PoolGameEngine {
       rp.rig.root.position.copy(rp.pos);
       rp.rig.root.rotation.set(0, rp.yaw, 0);
       rp.nameplate.visible = distSq <= nameCutSq;
-      if (throttleDistant && distSq > 38 * 38 && rp.userId !== this.mpSpectateUserId) {
+      if (throttleDistant && distSq > 38 * 38) {
         const step = distSq > 85 * 85 ? 4 : 2;
         if ((this.renderFrameIdx + rpIdx) % step === 0) {
           animatePlayerRig(rp.rig, effAnim, effSpeed, this.simTime, dt * step);
@@ -6946,7 +6832,6 @@ export class PoolGameEngine {
         animatePlayerRig(rp.rig, effAnim, effSpeed, this.simTime, dt);
       }
     }
-    this.syncSpectatorState(true);
     this.canPushTargetCache =
       this.isMultiplayer &&
       this.phase === 'playing' &&
@@ -7338,8 +7223,7 @@ export class PoolGameEngine {
 
     this.syncAllMonstersSwimmingAudio(this.phase === 'playing' && !this.mpLocalBeingEaten, skipMonster);
     const underwater = this.camera.position.y < waterY;
-    const focusInWater = this.mpSpectateUserId ? this.mpSpectatedInWater : this.inWater;
-    this.sound.updateAtmosphere(this.simTime, closestDist, highestAlert, focusInWater, underwater, true);
+    this.sound.updateAtmosphere(this.simTime, closestDist, highestAlert, this.inWater, underwater, true);
   }
 
   private syncAllMonstersSwimmingAudio(active: boolean, skipMonster: RuntimeMonster | null = null): void {
@@ -8603,11 +8487,10 @@ export class PoolGameEngine {
   }
 
   private computePlayCameraGoals(outTarget: THREE.Vector3, outCamPos: THREE.Vector3, dt?: number): void {
-    // Target local player or spectated alive teammate if caught/finished in multiplayer
-    const spectating = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
-    const spectatedRp = spectating ? this.getSpectatedRemotePlayer() : null;
-    let focusPos = spectatedRp ? spectatedRp.pos : this.playerPos;
-    const focusInWater = spectatedRp ? spectatedRp.inWater : this.inWater;
+    // Always keep camera centered on the local player (third-person orbit when waiting at portal or awaiting respawn)
+    const waitingAtPortalOrDead = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
+    let focusPos = this.playerPos;
+    const focusInWater = this.inWater;
     if (!Number.isFinite(focusPos.x) || !Number.isFinite(focusPos.y) || !Number.isFinite(focusPos.z)) {
       focusPos = this.activeSpawn;
     }
@@ -8619,7 +8502,7 @@ export class PoolGameEngine {
     const dirY = Math.sin(this.camPitch);
     const dirZ = Math.cos(this.camYaw) * cosPitch;
 
-    const useThirdPerson = this.isThirdPersonView() || spectating;
+    const useThirdPerson = this.isThirdPersonView() || waitingAtPortalOrDead;
     if (!useThirdPerson) {
       const b = this.currentLevel.bounds;
       const eyeOffset = focusInWater ? 1.52 : 1.58;
@@ -8638,7 +8521,7 @@ export class PoolGameEngine {
     outTarget.set(focusPos.x, focusPos.y + 1.48, focusPos.z);
 
     // Keep radial distance stable across brief water-jump arcs instead of jerking 4.4 <-> 5.0 mid-air
-    const desiredDist = focusInWater || (!spectating && this.waterJumpTimer > 0) ? 4.4 : 5.0;
+    const desiredDist = focusInWater || (!waitingAtPortalOrDead && this.waterJumpTimer > 0) ? 4.4 : 5.0;
 
     const idealX = outTarget.x + dirX * desiredDist;
     const idealY = outTarget.y + dirY * desiredDist;
@@ -8766,32 +8649,30 @@ export class PoolGameEngine {
       if (this.isMultiplayer) {
         if (this.mpLocalTransitioning || this.mpLocalEscaped) return;
         this.sound.playVictory();
-        const atFinalLevel = this.currentLevel.id >= TOTAL_LEVELS;
-        if (atFinalLevel) {
-          this.mpLocalEscaped = true;
-          this.playerRig.setVisible(false);
-          this.syncSpectatorState(true);
-        } else {
-          this.mpLocalTransitioning = true;
-          this.mpTransitionRequestedAt = performance.now();
-        }
+        this.mpLocalEscaped = true;
+        this.playerVel.set(0, 0, 0);
+        this.mpLastAnimState = 'idle';
+        this.mpLastHorizSpeed = 0;
+        const totalPlayers = Math.max(1, this.mpPortalTotalCount || this.remotePlayers.size + 1);
+        this.mpPortalTotalCount = totalPlayers;
+        this.mpPortalReadyCount = Math.min(totalPlayers, Math.max(1, this.mpPortalReadyCount + 1));
+        this.mpLastSentEscaped = true;
         this.callbacks.onMultiplayerTick?.({
           levelId: this.currentLevel.id,
           x: this.playerPos.x,
           y: this.playerPos.y,
           z: this.playerPos.z,
           yaw: this.playerYaw,
-          animState: this.mpLastAnimState,
-          horizSpeed: this.mpLastHorizSpeed,
-          inWater: this.inWater,
+          animState: 'idle',
+          horizSpeed: 0,
+          inWater: false,
           checkpointIndex: this.activeCheckpointIndex,
           escaped: true,
           characterId: this.localCharacterId,
         });
         this.callbacks.onMultiplayerPortalEnter?.(this.currentLevel.id);
-        if (atFinalLevel) {
-          this.callbacks.onMultiplayerEscaped?.();
-        }
+        this.callbacks.onMultiplayerEscaped?.();
+        this.emitHud(true);
         return;
       }
       this.setPhase('victory');
@@ -9444,18 +9325,21 @@ export class PoolGameEngine {
       else if (m.alert === 'searching' && alertState === 'calm') alertState = 'searching';
     }
 
-    const spectating = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
+    const waitingAtPortalOrDead = this.isMultiplayer && (!this.mpLocalAlive || this.mpLocalEscaped);
+    const mpPortalWaiting = this.isMultiplayer && this.mpLocalAlive && this.mpLocalEscaped;
+    const mpPortalReadyCount = this.isMultiplayer ? this.mpPortalReadyCount : 0;
+    const mpPortalTotalCount = this.isMultiplayer ? this.mpPortalTotalCount : 0;
     const timeRemaining = Math.round(Math.max(0, this.levelTimeRemaining) * 10) / 10;
     const timeElapsed = Math.round(this.levelTimeElapsed * 10) / 10;
     const stamina = Math.round(this.stamina);
-    const inWater = spectating ? false : this.inWater;
-    const underwater = spectating ? false : this.camera.position.y < this.currentLevel.bounds.waterY;
+    const inWater = waitingAtPortalOrDead ? false : this.inWater;
+    const underwater = waitingAtPortalOrDead ? false : this.camera.position.y < this.currentLevel.bounds.waterY;
     const waterJumpCooldown =
-      !spectating && this.inWater ? Math.round(Math.max(0, this.waterJumpCooldown) * 10) / 10 : 0;
+      !waitingAtPortalOrDead && this.inWater ? Math.round(Math.max(0, this.waterJumpCooldown) * 10) / 10 : 0;
     const monsterDist = Math.round(minMonsterDist);
     const pushCooldown =
-      this.isMultiplayer && !spectating ? Math.round(Math.max(0, this.pushCooldownTimer) * 10) / 10 : 0;
-    const canPushTarget = this.isMultiplayer && !spectating ? this.canPushTargetCache : false;
+      this.isMultiplayer && !waitingAtPortalOrDead ? Math.round(Math.max(0, this.pushCooldownTimer) * 10) / 10 : 0;
+    const canPushTarget = this.isMultiplayer && !waitingAtPortalOrDead ? this.canPushTargetCache : false;
 
     const prev = this.lastHudSnap;
     if (
@@ -9477,6 +9361,9 @@ export class PoolGameEngine {
       prev.isPointerLocked === this.isPointerLocked &&
       prev.deathReason === this.deathReason &&
       prev.isMultiplayer === this.isMultiplayer &&
+      prev.mpPortalWaiting === mpPortalWaiting &&
+      prev.mpPortalReadyCount === mpPortalReadyCount &&
+      prev.mpPortalTotalCount === mpPortalTotalCount &&
       prev.pushCooldown === pushCooldown &&
       prev.canPushTarget === canPushTarget
     ) {
@@ -9500,6 +9387,9 @@ export class PoolGameEngine {
     prev.isPointerLocked = this.isPointerLocked;
     prev.deathReason = this.deathReason;
     prev.isMultiplayer = this.isMultiplayer;
+    prev.mpPortalWaiting = mpPortalWaiting;
+    prev.mpPortalReadyCount = mpPortalReadyCount;
+    prev.mpPortalTotalCount = mpPortalTotalCount;
     prev.pushCooldown = pushCooldown;
     prev.canPushTarget = canPushTarget;
 
@@ -9523,6 +9413,9 @@ export class PoolGameEngine {
       isPointerLocked: this.isPointerLocked,
       deathReason: this.deathReason,
       isMultiplayer: this.isMultiplayer,
+      mpPortalWaiting,
+      mpPortalReadyCount,
+      mpPortalTotalCount,
       pushCooldown,
       pushMaxCooldown: PUSH_COOLDOWN_MS / 1000,
       canPushTarget,
@@ -9733,7 +9626,7 @@ export class PoolGameEngine {
     this.horrorComposerWarmed = false;
     this.applyQualityToRenderer();
     if (this.phase === 'playing') {
-      const shouldShowLocal = !this.isMultiplayer || (this.mpLocalAlive && !this.mpLocalEscaped);
+      const shouldShowLocal = !this.isMultiplayer || this.mpLocalAlive;
       this.playerRig.setVisible(shouldShowLocal);
       this.ensureLocalPlayerVisible();
       this.syncLocalPlayerRigTransform(this.mpLastAnimState, this.mpLastHorizSpeed);

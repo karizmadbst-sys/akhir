@@ -281,11 +281,6 @@ export async function createAppServer(options: ServerOptions = {}) {
             manager.handlePortalEnter(userId, levelId);
             break;
           }
-          case 'game:spectate': {
-            const levelId = typeof payload.levelId === 'number' ? payload.levelId : null;
-            manager.handleSpectateTarget(userId, levelId);
-            break;
-          }
           case 'game:push': {
             manager.handlePushPlayer(userId, payload as unknown as ClientPushPacket);
             break;
